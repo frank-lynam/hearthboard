@@ -1668,6 +1668,19 @@ class TicketsTest(unittest.TestCase):
         self.assertIn("'hobkin --hearthboard ' + location.origin + ' ' + token + ' --id ' + agent", page)
         self.assertIn("newToken(&quot;", page)
 
+    def test_flat_inbox_and_plain_text_replies(self):
+        """For agent harnesses: one flat list of what's owed, and a reply posted as plain text."""
+        h = self.srv.store.add_user("harness-agent", "agent", "test")[1]
+        c = self.j("POST", "/api/chat", {"members": ["harness-agent"], "body": "status on the deploy?"}, role="human")[1]
+        flat = self.j("GET", "/api/chat/inbox?flat=1", role=None, token=h)[1]["messages"]
+        mine = [m for m in flat if m["thread"] == c["id"]]
+        self.assertEqual([(m["from"], m["text"], m["needs_reply"]) for m in mine], [("Frank", "status on the deploy?", True)])
+        code, msg = self.j("POST", f"/api/chat/{c['id']}/messages", raw="On it: tests running now.".encode(), role=None,
+                           token=h, headers={"Content-Type": "text/plain"})
+        self.assertEqual((code, msg["body"]), (201, "On it: tests running now."))
+        flat = self.j("GET", "/api/chat/inbox?flat=1", role=None, token=h)[1]["messages"]
+        self.assertFalse([m for m in flat if m["thread"] == c["id"]])   # answered: nothing owed there now
+
     def test_skill(self):
         code, body, h = self.call("GET", "/api/skill", role="agent", headers={"Host": "tickets.example:43917"})
         text = body.decode()

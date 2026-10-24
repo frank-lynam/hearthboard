@@ -4122,14 +4122,15 @@ Tickets
 Chat
 
     GET    /api/chat/inbox             what's waiting for you: {"count": N, "conversations": [{...,
-                                       "needs_reply", "messages": [...]}]}
+                                       "needs_reply", "messages": [...]}]}; ?flat=1: {"messages": [{"id",
+                                       "thread", "thread_name", "from", "text", "needs_reply"}]}, oldest first
     GET    /api/chat                   {"conversations": [{"id", "name", "members", "unread", "last_message"}]}
     POST   /api/chat                   {"members": ["frank"], "title" (optional), "body" (optional first message)}
                                        -> the conversation (one person and no title: your existing one)
     GET    /api/chat/ID                the conversation, its latest 20 messages (messages_more) and "read_up_to"
     GET    /api/chat/ID/messages       ?before=MESSAGE_ID[&limit=N]: the page before that one; ?after=ID: all newer
                                        ones: {"messages", "more"}
-    POST   /api/chat/ID/messages       {"body": "..."} -> the message, with its "id"
+    POST   /api/chat/ID/messages       {"body": "..."} (or the text itself, as text/plain) -> the message
     POST   /api/chat/ID/attachments    a file for a message (as for tickets, with message_id)
     POST   /api/chat/ID/read           mark it read (enough for agents' messages; humans' need a reply)
     POST   /api/chat/ID/members        {"username": "agent-2"}: bring someone in
@@ -4770,6 +4771,13 @@ class Handler(BaseHTTPRequestHandler):
             for c in convs:  # humans' unread list: same shape
                 c.setdefault("count", len(c["messages"]))
                 c["messages"] = c["messages"][-PAGE:]
+            if (query.get("flat") or [""])[0] == "1":
+                # For agent harnesses (hobkin's front desk): one list, oldest first; needs_reply is false for
+                # messages that only need reading (other agents', notes), so a harness can leave those be.
+                flat = [{"id": m["id"], "thread": c["id"], "thread_name": c["name"], "from": m["author"],
+                         "text": m["body"], "needs_reply": m["role"] == "human"}
+                        for c in convs for m in c["messages"]]
+                return self.json(200, {"messages": sorted(flat, key=lambda x: x["id"])})
             return self.json(200, {"count": sum(c["count"] for c in convs), "conversations": convs})
         m = re.fullmatch(r"/api/chat/(\d+)(/messages|/attachments|/members|/read)?", path)
         if m:
@@ -4788,6 +4796,11 @@ class Handler(BaseHTTPRequestHandler):
                 msgs = store.messages(c["id"], limit=limit, before=num("before"))
                 return self.json(200, {"messages": msgs, "more": bool(msgs) and store.older_messages(c["id"], msgs[0]["id"])})
             if sub == "/messages" and method == "POST":
+                if self.headers.get("Content-Type", "").split(";")[0].strip() == "text/plain":   # the text itself
+                    n = int(self.headers.get("Content-Length") or 0)
+                    if n > 2_000_000:
+                        raise ApiError(413, "request too large")
+                    return self.json(201, store.post_message(cid, self.rfile.read(n).decode(errors="replace"), actor, role))
                 return self.json(201, store.post_message(cid, self.body_json(("body",)).get("body"), actor, role))
             if sub == "/members" and method == "POST":
                 return self.json(200, store.add_member(cid, str(self.body_json(("username",)).get("username") or ""), actor, role))
