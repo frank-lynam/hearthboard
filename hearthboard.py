@@ -269,7 +269,7 @@ CREATE INDEX IF NOT EXISTS events_ticket ON events(ticket_id, at);
 
 
 # Bumped (with a migration in Store.__init__) whenever the tables change.
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 SCHEMA_VERSION = 10
 TABLES = ("users", "settings", "tickets", "deps", "comments", "attachments", "events",
