@@ -48,10 +48,12 @@ import tarfile
 import tempfile
 import threading
 import time
+from contextlib import closing
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, quote, urlsplit
+from types import SimpleNamespace
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 STATUSES = ["backlog", "ready", "in_progress", "review", "done"]
 LABELS = {"backlog": "Backlog", "ready": "Ready", "in_progress": "In progress", "review": "Needs review", "done": "Done"}
@@ -233,6 +235,12 @@ CREATE TABLE IF NOT EXISTS users (
   kind TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE, created_by TEXT, created_at REAL NOT NULL,
   disabled INTEGER NOT NULL DEFAULT 0, last_seen REAL);
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS projects (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, slug TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '', created_by TEXT, created_at REAL NOT NULL, archived INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS project_members (
+  project_id INTEGER NOT NULL REFERENCES projects(id), username TEXT NOT NULL COLLATE NOCASE, role TEXT NOT NULL,
+  PRIMARY KEY (project_id, username));
 CREATE TABLE IF NOT EXISTS deps (
   ticket_id TEXT NOT NULL REFERENCES tickets(id), depends_on TEXT NOT NULL REFERENCES tickets(id),
   PRIMARY KEY (ticket_id, depends_on));
@@ -268,13 +276,23 @@ CREATE INDEX IF NOT EXISTS events_ticket ON events(ticket_id, at);
 """
 
 
-# Bumped (with a migration in Store.__init__) whenever the tables change.
 __version__ = "0.1.2"
 
-SCHEMA_VERSION = 10
-TABLES = ("users", "settings", "tickets", "deps", "comments", "attachments", "events",
+# Bumped whenever the tables change. A board made by an older version won't open until a person runs
+# `hearthboard --upgrade` (it backs up first); hearthboard never changes an install on its own.
+SCHEMA_VERSION = 11
+TABLES = ("users", "settings", "projects", "project_members", "tickets", "deps", "comments", "attachments", "events",
           "conversations", "chat_members", "messages", "chat_files", "wiki_pages", "wiki_revisions")
-KINDS = ("human", "agent", "guest")  # guests can read everything and change nothing
+KINDS = ("human", "agent", "guest")  # guests can read everything they can see and change nothing
+# Roles in a project: admins also manage its members; members work it; viewers read it. Agents are members or
+# viewers, guests viewers; only humans are admins (of a project, or global admins of every one).
+ROLES = ("admin", "member", "viewer")
+GENERAL = "general"  # every board has it; a ticket filed with no project goes there
+SLUG_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+
+
+class NeedsUpgrade(Exception):
+    """The board was made by an older hearthboard: a person runs --upgrade (which backs up first)."""
 USERNAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,31}")
 
 
@@ -321,7 +339,7 @@ class Store:
     """The database and the uploaded files. One SQLite connection per thread;
     writes go through one lock so ids and status changes never race."""
 
-    def __init__(self, data_dir):
+    def __init__(self, data_dir, upgrade=False):
         self.dir = Path(data_dir).resolve()
         self.files = self.dir / "files"
         self.files.mkdir(parents=True, exist_ok=True)
@@ -329,12 +347,20 @@ class Store:
         self.local = threading.local()
         self.write_lock = threading.Lock()
         self.changed = threading.Condition()  # notified after every change; /api/wait sleeps on it
+        self.upgraded = None                  # with upgrade: what the upgrade did
         db = self.db()
+        fresh = not db.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'tickets'").fetchone()
+        version = db.execute("PRAGMA user_version").fetchone()[0]
+        if not fresh and version < SCHEMA_VERSION and not upgrade:
+            raise NeedsUpgrade(f"this board ({self.dir}) was made by an older hearthboard (schema {version}; this "
+                               f"version needs {SCHEMA_VERSION}). Run: hearthboard --upgrade --data {self.dir} "
+                               f"(it backs the board up first)")
+        if upgrade and (fresh or version >= SCHEMA_VERSION):
+            raise NeedsUpgrade(f"{self.dir} is already up to date (schema {version}): nothing to upgrade"
+                               if not fresh else f"{self.dir} has no board yet: nothing to upgrade")
         db.executescript(SCHEMA)
-        # 1 -> 2 added the users table, 2 -> 3 the settings table, 3 -> 4 the
-        # deps table, 4 -> 5 the chat tables, 5 -> 6 the wiki tables (all
-        # created above); the columns are added here (6 -> 7: uploaded
-        # checklists; tickets.checklist_path is no longer used; 7 -> 8: cancelled).
+        # Columns added since the first version (the tables are created above): 6 -> 7 uploaded checklists
+        # (tickets.checklist_path is no longer used), 7 -> 8 cancelled, 10 -> 11 projects and global admins.
         for table, col, decl in (("tickets", "assignee", "TEXT"), ("users", "guidance", "TEXT"),
                                  ("tickets", "kind", "TEXT NOT NULL DEFAULT 'ticket'"), ("tickets", "epic_id", "TEXT"),
                                  ("tickets", "proposed", "INTEGER NOT NULL DEFAULT 0"),
@@ -342,18 +368,41 @@ class Store:
                                  ("tickets", "checklist_md", "TEXT"), ("tickets", "checklist_by", "TEXT"),
                                  ("tickets", "checklist_at", "REAL"),
                                  ("tickets", "cancelled", "INTEGER NOT NULL DEFAULT 0"),
-                                 ("users", "prefs", "TEXT")):
+                                 ("users", "prefs", "TEXT"), ("tickets", "project_id", "INTEGER"),
+                                 ("users", "global_admin", "INTEGER NOT NULL DEFAULT 0"),
+                                 ("wiki_pages", "project_id", "INTEGER"), ("conversations", "project_id", "INTEGER")):
             if col not in {r[1] for r in db.execute(f"PRAGMA table_info({table})")}:
                 db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
         db.execute("CREATE INDEX IF NOT EXISTS tickets_assignee ON tickets(assignee, status)")
         db.execute("CREATE INDEX IF NOT EXISTS tickets_epic ON tickets(epic_id)")
+        db.execute("CREATE INDEX IF NOT EXISTS tickets_project ON tickets(project_id, status)")
         db.execute("CREATE INDEX IF NOT EXISTS deps_on ON deps(depends_on)")
+        db.execute("CREATE INDEX IF NOT EXISTS members_user ON project_members(username)")
         with db:
+            if not db.execute("SELECT 1 FROM projects WHERE slug = ?", (GENERAL,)).fetchone():
+                db.execute("INSERT INTO projects (slug, name, description, created_by, created_at) VALUES (?,?,?,?,?)",
+                           (GENERAL, "General", "Everything not filed under another project.", "hearthboard", time.time()))
             self._sync_epics(db, [r[0] for r in db.execute("SELECT id FROM tickets WHERE kind = 'epic'")])
-        with db:  # 9 -> 10: ordinary tickets are kind "ticket" (they were "task")
-            db.execute("UPDATE tickets SET kind = 'ticket' WHERE kind = 'task'")
+            if upgrade:
+                db.execute("UPDATE tickets SET kind = 'ticket' WHERE kind = 'task'")   # 9 -> 10
+                self.upgraded = self._into_general(db, humans_global=True)
         if db.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
             db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+    def _into_general(self, db, humans_global):
+        """A board from before projects: every ticket and wiki page goes in `general`; agents become its members
+        and guests its viewers; with `humans_global`, every human becomes a global admin (so nothing they could
+        do stops working). Inside the caller's transaction. Returns what it did."""
+        gid = db.execute("SELECT id FROM projects WHERE slug = ?", (GENERAL,)).fetchone()[0]
+        done = {"tickets": db.execute("UPDATE tickets SET project_id = ? WHERE project_id IS NULL", (gid,)).rowcount,
+                "wiki_pages": db.execute("UPDATE wiki_pages SET project_id = ? WHERE project_id IS NULL",
+                                         (gid,)).rowcount}
+        done["global_admins"] = db.execute(
+            "UPDATE users SET global_admin = 1 WHERE kind = 'human' AND global_admin = 0").rowcount if humans_global else 0
+        done["members"] = sum(db.execute(
+            "INSERT OR IGNORE INTO project_members (project_id, username, role) SELECT ?, username, ? FROM users "
+            "WHERE kind = ?", (gid, role, kind)).rowcount for kind, role in (("agent", "member"), ("guest", "viewer")))
+        return done
 
     def db(self):
         c = getattr(self.local, "conn", None)
@@ -365,22 +414,102 @@ class Store:
             self.local.conn = c
         return c
 
+    # --- who's asking: each request sets it (Handler.route); everything the store reads or changes is scoped
+    # to the projects they can see. Not set (the command line, the server's own work): everything.
+    def set_viewer(self, username, kind):
+        """Scope this thread's queries to `username` (None: someone not signed in, who sees no project)."""
+        if not username:
+            self.local.viewer = {"name": None, "kind": None, "global": False, "roles": {}}
+            return
+        row = self.db().execute("SELECT username, kind, global_admin FROM users WHERE username = ?", (username,)).fetchone()
+        roles = {r[0]: r[1] for r in self.db().execute(
+            "SELECT project_id, role FROM project_members WHERE username = ?", (username,))}
+        self.local.viewer = {"name": row["username"], "kind": row["kind"],
+                             "global": bool(row["global_admin"]) and row["kind"] == "human", "roles": roles}
+
+    def clear_viewer(self):
+        self.local.viewer = None
+
+    def _viewer(self):
+        return getattr(self.local, "viewer", None)
+
+    def is_global_admin(self):
+        v = self._viewer()
+        return v is None or v["global"]
+
+    def role_in(self, pid):
+        """This request's role in project `pid`: admin, member, viewer or None (global admins: admin)."""
+        v = self._viewer()
+        if v is None or v["global"]:
+            return "admin"
+        return v["roles"].get(pid)
+
+    def can_see(self, pid):
+        return self.role_in(pid) is not None
+
+    def visible_ids(self):
+        """Ids of the projects this request can see, or None for all of them."""
+        v = self._viewer()
+        return None if v is None or v["global"] else set(v["roles"])
+
+    def working_ids(self):
+        """Ids of the projects where this request can do work (admin or member), or None for all."""
+        v = self._viewer()
+        return None if v is None or v["global"] else {p for p, r in v["roles"].items() if r in ("admin", "member")}
+
+    def _in(self, col, ids):
+        """SQL for `col` being one of `ids` (None: no limit), and its arguments."""
+        if ids is None:
+            return "1", []
+        if not ids:
+            return "0", []
+        return f"{col} IN ({','.join('?' * len(ids))})", list(ids)
+
+    def _work_sql(self, alias="t", projects=None):
+        """SQL for tickets in projects this request works in (not just views), narrowed to `projects` (ids)."""
+        ids = self.working_ids()
+        if projects is not None:
+            ids = set(projects) if ids is None else ids & set(projects)
+        return self._in(f"{alias}.project_id", ids)
+
+    def _check_worker(self, pid, what="change things"):
+        """Members and admins of a project work in it; viewers only read."""
+        role = self.role_in(pid)
+        if role is None:
+            raise ApiError(403, f"that's in a project you're not in: you can't {what} there")
+        if role == "viewer":
+            raise ApiError(403, f"you're a viewer in {self.project_by_id(pid)['slug']}: you can read it but not {what}")
+
     # --- users
     def users(self):
-        return [dict(r) for r in self.db().execute(
-            "SELECT id, username, kind, created_by, created_at, disabled, last_seen, guidance FROM users ORDER BY kind, username")]
+        out = [dict(r) for r in self.db().execute(
+            "SELECT id, username, kind, created_by, created_at, disabled, last_seen, guidance, global_admin FROM users "
+            "ORDER BY kind, username")]
+        roles = {}
+        for r in self.db().execute("SELECT m.username, p.slug, m.role FROM project_members m JOIN projects p "
+                                   "ON p.id = m.project_id ORDER BY p.slug"):
+            roles.setdefault(r[0].lower(), {})[r[1]] = r[2]
+        for u in out:
+            u["global_admin"] = bool(u["global_admin"])
+            u["projects"] = roles.get(u["username"].lower(), {})
+        return out
 
     def user(self, username):
-        row = self.db().execute("SELECT id, username, kind, created_by, created_at, disabled, last_seen, guidance FROM users "
-                                "WHERE username = ?", (username,)).fetchone()
+        row = self.db().execute("SELECT id, username, kind, created_by, created_at, disabled, last_seen, guidance, "
+                                "global_admin FROM users WHERE username = ?", (username,)).fetchone()
         if not row:
             raise ApiError(404, f"no user {username}")
-        return dict(row)
+        u = dict(row)
+        u["global_admin"] = bool(u["global_admin"])
+        u["projects"] = {r[0]: r[1] for r in self.db().execute(
+            "SELECT p.slug, m.role FROM project_members m JOIN projects p ON p.id = m.project_id "
+            "WHERE m.username = ? ORDER BY p.slug", (u["username"],))}
+        return u
 
     def user_by_token(self, token):
         """The active user this token belongs to, or None."""
-        row = self.db().execute("SELECT id, username, kind, disabled, last_seen FROM users WHERE token_hash = ?",
-                                (token_hash(token),)).fetchone()
+        row = self.db().execute("SELECT id, username, kind, disabled, last_seen, global_admin FROM users "
+                                "WHERE token_hash = ?", (token_hash(token),)).fetchone()
         if not row or row["disabled"]:
             return None
         now = time.time()
@@ -389,21 +518,32 @@ class Store:
                 db.execute("UPDATE users SET last_seen = ? WHERE id = ?", (now, row["id"]))
         return dict(row)
 
-    def add_user(self, username, kind, created_by, token=None):
-        """A new user and their token (returned once; only its hash is kept)."""
+    def add_user(self, username, kind, created_by, token=None, global_admin=False):
+        """A new user and their token (returned once; only its hash is kept). They join `general` (agents and
+        humans as members, guests as viewers); a global admin adds them to other projects. The first human on a
+        board with no global admin becomes one, so someone can always run it."""
         username = str(username or "").strip()
         if not USERNAME_RE.fullmatch(username):
             raise ApiError(400, "usernames are 1-32 letters, digits, '.', '_' or '-', starting with a letter or digit")
         if kind not in KINDS:
             raise ApiError(400, f"kind is one of {list(KINDS)}")
+        if global_admin and kind != "human":
+            raise ApiError(400, "only humans can be global admins")
         token = token or new_token()
         with self.write_lock:
             db = self.db()
             if db.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone():
                 raise ApiError(409, f"there's already a user called {username}")
+            if kind == "human" and not db.execute(
+                    "SELECT 1 FROM users WHERE global_admin = 1 AND kind = 'human' AND disabled = 0").fetchone():
+                global_admin = True
             with db:
-                db.execute("INSERT INTO users (username, kind, token_hash, created_by, created_at) VALUES (?,?,?,?,?)",
-                           (username, kind, token_hash(token), created_by, time.time()))
+                db.execute("INSERT INTO users (username, kind, token_hash, created_by, created_at, global_admin) "
+                           "VALUES (?,?,?,?,?,?)",
+                           (username, kind, token_hash(token), created_by, time.time(), 1 if global_admin else 0))
+                gid = db.execute("SELECT id FROM projects WHERE slug = ?", (GENERAL,)).fetchone()[0]
+                db.execute("INSERT OR IGNORE INTO project_members (project_id, username, role) VALUES (?,?,?)",
+                           (gid, username, "viewer" if kind == "guest" else "member"))
         return self.user(username), token
 
     def new_user_token(self, username):
@@ -468,22 +608,191 @@ class Store:
             if disabled and u["kind"] == "human" and db.execute(
                     "SELECT COUNT(*) FROM users WHERE kind = 'human' AND disabled = 0 AND id != ?", (u["id"],)).fetchone()[0] == 0:
                 raise ApiError(409, "that's the last active human; add another before disabling this one")
+            if disabled and u["global_admin"] and not db.execute(
+                    "SELECT COUNT(*) FROM users WHERE global_admin = 1 AND kind = 'human' AND disabled = 0 AND id != ?",
+                    (u["id"],)).fetchone()[0]:
+                raise ApiError(409, "that's the last active global admin; make someone else one first")
             with db:
                 db.execute("UPDATE users SET disabled = ? WHERE id = ?", (1 if disabled else 0, u["id"]))
         return self.user(username)
 
-    # --- reads
-    def ticket(self, tid):
-        row = self.db().execute("SELECT * FROM tickets WHERE id = ?", (norm_id(tid),)).fetchone()
+    def set_global_admin(self, username, on):
+        """Only global admins make or unmake global admins; only humans can be one; one must always be left."""
+        if not self.is_global_admin():
+            raise ApiError(403, "only global admins can do that")
+        u = self.user(username)
+        if on and u["kind"] != "human":
+            raise ApiError(400, "only humans can be global admins")
+        with self.write_lock:
+            db = self.db()
+            if not on and u["global_admin"] and not db.execute(
+                    "SELECT COUNT(*) FROM users WHERE global_admin = 1 AND kind = 'human' AND disabled = 0 AND id != ?",
+                    (u["id"],)).fetchone()[0]:
+                raise ApiError(409, "that's the last active global admin; make someone else one first")
+            with db:
+                db.execute("UPDATE users SET global_admin = ? WHERE id = ?", (1 if on else 0, u["id"]))
+        return self.user(username)
+
+    # --- projects: one per team; accounts are board-wide, memberships per project
+    def project_by_id(self, pid):
+        row = self.db().execute("SELECT * FROM projects WHERE id = ?", (pid,)).fetchone()
         if not row:
-            raise ApiError(404, f"no ticket {tid}")
+            raise ApiError(404, "no such project")
         return dict(row)
 
+    def project(self, slug):
+        """A project this request can see, by slug (or id); others are 404, as if they weren't there."""
+        row = self.db().execute("SELECT * FROM projects WHERE slug = ? OR CAST(id AS TEXT) = ?",
+                                (str(slug).strip().lower(), str(slug))).fetchone()
+        if not row or not self.can_see(row["id"]):
+            raise ApiError(404, f"no project {slug}")
+        p = dict(row)
+        p["role"] = self.role_in(p["id"])
+        return p
+
+    def projects(self, include_archived=True):
+        """The projects this request can see, with its role in each and their open ticket counts."""
+        cond, args = self._in("p.id", self.visible_ids())
+        rows = [dict(r) for r in self.db().execute(
+            f"SELECT p.*, (SELECT COUNT(*) FROM tickets t WHERE t.project_id = p.id AND t.status != 'done' "
+            f"AND t.kind = 'ticket') AS open_tickets FROM projects p WHERE {cond}"
+            + ("" if include_archived else " AND p.archived = 0") + " ORDER BY p.archived, p.slug = ? DESC, p.name",
+            args + [GENERAL])]
+        for p in rows:
+            p["role"] = self.role_in(p["id"])
+        return rows
+
+    def project_ids(self, slugs):
+        """Ids for a project filter ("records" or "records,legal"), each one this request can see."""
+        out = set()
+        for slug in [x.strip() for x in str(slugs or "").split(",") if x.strip()]:
+            out.add(self.project(slug)["id"])
+        return out
+
+    def create_project(self, data, actor):
+        if not self.is_global_admin():
+            raise ApiError(403, "only global admins create projects")
+        name = str(data.get("name") or "").strip()
+        slug = str(data.get("slug") or "").strip().lower() or re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+        if not name:
+            raise ApiError(400, "a project needs a name")
+        if not SLUG_RE.fullmatch(slug):
+            raise ApiError(400, "a slug is lower-case letters and digits, words joined by hyphens: benefits-processing")
+        with self.write_lock:
+            db = self.db()
+            if db.execute("SELECT 1 FROM projects WHERE slug = ?", (slug,)).fetchone():
+                raise ApiError(409, f"there's already a project {slug}")
+            with db:
+                db.execute("INSERT INTO projects (slug, name, description, created_by, created_at) VALUES (?,?,?,?,?)",
+                           (slug, name, str(data.get("description") or "").strip(), actor, time.time()))
+        return self.project(slug)
+
+    def update_project(self, slug, data, actor):
+        p = self.project(slug)
+        if self.role_in(p["id"]) != "admin":
+            raise ApiError(403, f"only {p['slug']}'s admins (or a global admin) can rename it")
+        fields = {k: str(data[k]).strip() for k in ("name", "description") if k in data}
+        if "name" in fields and not fields["name"]:
+            raise ApiError(400, "the name can't be empty")
+        with self.write_lock, self.db() as db:
+            for k, v in fields.items():
+                db.execute(f"UPDATE projects SET {k} = ? WHERE id = ?", (v, p["id"]))
+        return self.project(p["slug"])
+
+    def archive_project(self, slug, archived=True):
+        """Archived projects stay readable by their members and take no new tickets or proposals."""
+        if not self.is_global_admin():
+            raise ApiError(403, "only global admins archive projects")
+        p = self.project(slug)
+        if p["slug"] == GENERAL and archived:
+            raise ApiError(409, "general can't be archived: tickets filed without a project go there")
+        with self.write_lock, self.db() as db:
+            db.execute("UPDATE projects SET archived = ? WHERE id = ?", (1 if archived else 0, p["id"]))
+        return self.project(p["slug"])
+
+    def members(self, slug):
+        p = self.project(slug)
+        return [dict(r) for r in self.db().execute(
+            "SELECT m.username, m.role, u.kind, u.global_admin, u.disabled FROM project_members m "
+            "JOIN users u ON u.username = m.username COLLATE NOCASE WHERE m.project_id = ? "
+            "ORDER BY CASE m.role WHEN 'admin' THEN 0 WHEN 'member' THEN 1 ELSE 2 END, m.username", (p["id"],))]
+
+    def set_member(self, slug, username, role, actor):
+        """Add someone to a project, change their role, or (role None) take them out: then the tickets
+        assigned to them there become unassigned, each with an event. Global admins for any project; a
+        project's admins for theirs. Existing accounts only; agents are members or viewers, guests viewers."""
+        p = self.project(slug)
+        if self.role_in(p["id"]) != "admin":
+            raise ApiError(403, f"only {p['slug']}'s admins (or a global admin) manage its members")
+        u = self.user(username)
+        if role is not None and role not in ROLES:
+            raise ApiError(400, f"role is one of {list(ROLES)}, or null to take them out")
+        if role == "admin" and u["kind"] != "human":
+            raise ApiError(400, f"{u['username']} is {'an agent' if u['kind'] == 'agent' else 'a guest'}: "
+                                "only humans are admins")
+        if role == "member" and u["kind"] == "guest":
+            raise ApiError(400, f"{u['username']} is a guest: guests are viewers only")
+        now = time.time()
+        with self.write_lock:
+            db = self.db()
+            with db:
+                if role is None:
+                    db.execute("DELETE FROM project_members WHERE project_id = ? AND username = ?", (p["id"], u["username"]))
+                    for r in db.execute("SELECT id FROM tickets WHERE project_id = ? AND assignee = ? COLLATE NOCASE",
+                                        (p["id"], u["username"])).fetchall():
+                        db.execute("UPDATE tickets SET assignee = NULL, updated_at = ? WHERE id = ?", (now, r[0]))
+                        self._event(db, r[0], actor, "human", "assignee", u["username"], None, now)
+                else:
+                    db.execute("INSERT INTO project_members (project_id, username, role) VALUES (?,?,?) "
+                               "ON CONFLICT(project_id, username) DO UPDATE SET role = excluded.role",
+                               (p["id"], u["username"], role))
+        return self.members(p["slug"])
+
+    # --- reads
+    def _sees_ticket(self, t):
+        """Its project is one this request can see; an epic, also if one of its tickets is."""
+        if self.can_see(t["project_id"]):
+            return True
+        if t["kind"] == "epic":
+            cond, args = self._in("project_id", self.visible_ids())
+            return bool(self.db().execute(f"SELECT 1 FROM tickets WHERE epic_id = ? AND {cond} LIMIT 1",
+                                          [t["id"]] + args).fetchone())
+        return False
+
+    def _see_sql(self, alias="t"):
+        """SQL for the tickets this request can see (epics too when one of their tickets is), and its arguments."""
+        ids = self.visible_ids()
+        if ids is None:
+            return "1", []
+        cond, args = self._in(f"{alias}.project_id", ids)
+        inner, inner_args = self._in("v.project_id", ids)
+        return (f"({cond} OR ({alias}.kind = 'epic' AND EXISTS (SELECT 1 FROM tickets v WHERE v.epic_id = {alias}.id "
+                f"AND {inner})))", args + inner_args)
+
+    def _project_of(self, t):
+        """Add the ticket's project's slug and name."""
+        row = self.db().execute("SELECT slug, name FROM projects WHERE id = ?", (t.get("project_id"),)).fetchone()
+        t["project"], t["project_name"] = (row["slug"], row["name"]) if row else (None, None)
+        return t
+
+    def ticket(self, tid):
+        row = self.db().execute("SELECT * FROM tickets WHERE id = ?", (norm_id(tid),)).fetchone()
+        if not row or not self._sees_ticket(row):
+            raise ApiError(404, f"no ticket {tid}")
+        return self._project_of(dict(row))
+
     def tickets(self, statuses=None, q=None, limit=500, recent_first=False, assignee=None, kind=None, epic=None,
-                proposed=None):
+                proposed=None, projects=None):
+        """Tickets this request can see, filtered; `projects`: a set of project ids to limit it to."""
         sql, args = "SELECT t.*, (SELECT COUNT(*) FROM comments c WHERE c.ticket_id = t.id) AS comment_count, " \
                     "(SELECT COUNT(*) FROM attachments a WHERE a.ticket_id = t.id) AS attachment_count FROM tickets t", []
-        where = []
+        see, see_args = self._see_sql()
+        where = [see]
+        args += see_args
+        if projects is not None:
+            cond, more = self._in("t.project_id", projects)
+            where.append(cond)
+            args += more
         if statuses:
             where.append("status IN (%s)" % ",".join("?" * len(statuses)))
             args += statuses
@@ -514,13 +823,21 @@ class Store:
                                      "ORDER BY created_at DESC, id DESC LIMIT 1", (t["id"],)).fetchone()
             t["last_comment"] = dict(last) if last else None
             self._links(t)
+            self._project_of(t)
         return out
 
+    HIDDEN = "a ticket in another project"
+
     def blockers(self, tid):
-        """Ids of the tickets that must be done first and aren't yet."""
-        return [r["id"] for r in self.db().execute(
-            "SELECT p.id FROM deps d JOIN tickets p ON p.id = d.depends_on "
+        """Ids of the tickets that must be done first and aren't yet (one this request can't see: HIDDEN)."""
+        return [r["id"] if self.can_see(r["project_id"]) else self.HIDDEN for r in self.db().execute(
+            "SELECT p.id, p.project_id FROM deps d JOIN tickets p ON p.id = d.depends_on "
             "WHERE d.ticket_id = ? AND p.status != 'done' ORDER BY p.id", (tid,))]
+
+    def _hide(self, rows):
+        """Linked tickets this request can't see: no id or title, just that it's there (and its status)."""
+        return [r if self.can_see(r.pop("project_id")) else {"id": None, "title": self.HIDDEN, "status": r["status"],
+                                                             "hidden": True} for r in rows]
 
     def _links(self, t):
         """Add what a list needs to show: blockers, the epic's title, an epic's progress, checklist progress."""
@@ -538,10 +855,17 @@ class Store:
         return t
 
     def epic_progress(self, eid):
-        counts = {r[0]: r[1] for r in self.db().execute(
-            "SELECT status, COUNT(*) FROM tickets WHERE epic_id = ? AND declined = 0 AND cancelled = 0 GROUP BY status",
-            (eid,))}
-        return {"total": sum(counts.values()), "done": counts.get("done", 0), "by_status": counts}
+        """Progress over the epic's tickets this request can see; `hidden`: how many others there are."""
+        cond, args = self._in("project_id", self.visible_ids())
+        counts, hidden = {}, 0
+        for r in self.db().execute(
+                f"SELECT status, {cond} AS seen, COUNT(*) FROM tickets WHERE epic_id = ? AND declined = 0 AND cancelled = 0 "
+                f"GROUP BY status, seen", args + [eid]):
+            if r[1]:
+                counts[r[0]] = counts.get(r[0], 0) + r[2]
+            else:
+                hidden += r[2]
+        return {"total": sum(counts.values()), "done": counts.get("done", 0), "by_status": counts, "hidden": hidden}
 
     def detail(self, tid, limit=None):
         """A ticket with its comments, files, history and the rest. With `limit`, only the latest `limit`
@@ -563,14 +887,14 @@ class Store:
         refs = wiki_refs(t["description"]) + [p for c in every for p in wiki_refs(c["body"])]
         t["wiki_links"] = [self.wiki_link_info(p) for p in dict.fromkeys(refs)]
         # Predecessors: the ones still in the way, and the finished ones (which no longer block anything).
-        deps = [dict(r) for r in db.execute(
-            "SELECT p.id, p.title, p.status, p.declined, p.cancelled FROM deps d JOIN tickets p ON p.id = d.depends_on "
-            "WHERE d.ticket_id = ? ORDER BY p.id", (t["id"],))]
+        deps = self._hide([dict(r) for r in db.execute(
+            "SELECT p.id, p.title, p.status, p.declined, p.cancelled, p.project_id FROM deps d "
+            "JOIN tickets p ON p.id = d.depends_on WHERE d.ticket_id = ? ORDER BY p.id", (t["id"],))])
         t["depends_on"] = [d for d in deps if d["status"] != "done"]
         t["done_dependencies"] = [d for d in deps if d["status"] == "done"]
-        t["unblocks"] = [dict(r) for r in db.execute(
-            "SELECT n.id, n.title, n.status FROM deps d JOIN tickets n ON n.id = d.ticket_id "
-            "WHERE d.depends_on = ? ORDER BY n.id", (t["id"],))]
+        t["unblocks"] = self._hide([dict(r) for r in db.execute(
+            "SELECT n.id, n.title, n.status, n.project_id FROM deps d JOIN tickets n ON n.id = d.ticket_id "
+            "WHERE d.depends_on = ? ORDER BY n.id", (t["id"],))])
         if t["kind"] == "epic":
             # Most complete first: done, review, in progress, ready, backlog; declined or cancelled last; oldest
             # first within each.
@@ -602,6 +926,10 @@ class Store:
         row = self.db().execute("SELECT * FROM attachments WHERE id = ?", (aid,)).fetchone()
         if not row:
             raise ApiError(404, "no such file")
+        try:
+            self.ticket(row["ticket_id"])
+        except ApiError:
+            raise ApiError(404, "no such file") from None
         return dict(row)
 
     # --- writes
@@ -609,14 +937,35 @@ class Store:
         db.execute("INSERT INTO events (ticket_id, actor, role, field, old, new, at) VALUES (?,?,?,?,?,?,?)",
                    (tid, actor, role, field, None if old is None else str(old), None if new is None else str(new), now))
 
-    def _check_assignee(self, name):
-        """A real user's exact name, or None for unassigned."""
+    def _check_assignee(self, name, pid=None):
+        """A real user's exact name, or None for unassigned. With `pid`, someone who works in that project
+        (a member or admin there, or a global admin)."""
         if name in (None, ""):
             return None
         u = self.user(str(name))
         if u["kind"] == "guest":
             raise ApiError(400, f"{u['username']} is a guest: guests can't be assigned work")
+        if pid is not None and not self._works_in(u["username"], pid):
+            raise ApiError(400, f"{u['username']} isn't a member of {self.project_by_id(pid)['slug']}: "
+                                "add them to it first")
         return u["username"]
+
+    def _works_in(self, username, pid):
+        row = self.db().execute("SELECT global_admin, kind FROM users WHERE username = ?", (username,)).fetchone()
+        if row and row["global_admin"] and row["kind"] == "human":
+            return True
+        return bool(self.db().execute("SELECT 1 FROM project_members WHERE project_id = ? AND username = ? "
+                                      "AND role IN ('admin', 'member')", (pid, username)).fetchone())
+
+    def _target_project(self, slug):
+        """A project to file into or move to, by slug: any that exists and isn't archived (a move can go to a
+        project the mover isn't in; it lands in that project's backlog)."""
+        row = self.db().execute("SELECT * FROM projects WHERE slug = ?", (str(slug).strip().lower(),)).fetchone()
+        if not row:
+            raise ApiError(404, f"no project {slug}")
+        if row["archived"]:
+            raise ApiError(409, f"{row['slug']} is archived: it takes no new tickets")
+        return dict(row)
 
     def _check_epic(self, eid):
         """An epic's id, or None. A complete epic is fine (a new ticket makes it active again); a cancelled
@@ -669,6 +1018,11 @@ class Store:
         title = str(data.get("title") or "").strip()
         if not title:
             raise ApiError(400, "a ticket needs a title")
+        slug = str(data.get("project") or GENERAL)
+        proj = self.project(slug)                     # one you can see,
+        if proj["archived"]:
+            raise ApiError(409, f"{proj['slug']} is archived: it takes no new tickets or proposals")
+        self._check_worker(proj["id"], "file tickets there")   # and work in
         kind = data.get("kind") or "ticket"
         if kind not in ("ticket", "epic"):
             raise ApiError(400, 'kind is "ticket" or "epic"')
@@ -698,7 +1052,7 @@ class Store:
             raise ApiError(400, "priority is 1 (high), 2 (normal) or 3 (low)")
         if role == "agent" and data.get("assignee"):
             raise ApiError(403, "agents can't assign new tickets; a human assigns them")
-        assignee = self._check_assignee(data.get("assignee"))
+        assignee = self._check_assignee(data.get("assignee"), proj["id"])
         now = time.time()
         with self.write_lock:
             db = self.db()
@@ -706,9 +1060,10 @@ class Store:
             with db:
                 # Tickets an agent creates are proposals until a human accepts them.
                 db.execute("INSERT INTO tickets (id, title, description, status, priority, created_by, "
-                           "created_at, updated_at, assignee, kind, epic_id, proposed) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                           "created_at, updated_at, assignee, kind, epic_id, proposed, project_id) "
+                           "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                            (tid, title, str(data.get("description") or ""), status, priority,
-                            actor, now, now, assignee, kind, epic_id, 1 if role == "agent" else 0))
+                            actor, now, now, assignee, kind, epic_id, 1 if role == "agent" else 0, proj["id"]))
                 self._event(db, tid, actor, role, "proposed" if role == "agent" else "created", None, status, now)
                 for d in deps:
                     db.execute("INSERT OR IGNORE INTO deps (ticket_id, depends_on) VALUES (?, ?)", (tid, d))
@@ -719,10 +1074,38 @@ class Store:
 
     def update(self, tid, data, actor, role):
         fields = {k: data[k] for k in ("title", "description", "status", "priority", "assignee", "epic_id") if k in data}
-        if not fields:
-            raise ApiError(400, "nothing to change (title, description, status, priority, assignee, epic_id)")
+        move = data.get("project")
+        if not fields and not move:
+            raise ApiError(400, "nothing to change (title, description, status, priority, assignee, epic_id, project)")
+        t = self.ticket(tid)
+        self._check_worker(t["project_id"])
+        if move and str(move).strip().lower() != t["project"]:
+            # A move: a human member of the ticket's project (or a global admin) can send it to any project; it
+            # lands in that project's backlog, recorded with who moved it.
+            if role != "human":
+                raise ApiError(403, "only humans move tickets between projects")
+            to = self._target_project(move)
+            if fields:                                  # the other changes first, while it's still here
+                self.update(tid, {k: data[k] for k in fields}, actor, role)
+                t = self.ticket(tid)
+            now = time.time()
+            with self.write_lock, self.db() as db:
+                db.execute("UPDATE tickets SET project_id = ?, updated_at = ? WHERE id = ?", (to["id"], now, t["id"]))
+                self._event(db, t["id"], actor, role, "project", t["project"], to["slug"], now)
+                if t["kind"] == "ticket" and t["status"] != "backlog":
+                    db.execute("UPDATE tickets SET status = 'backlog' WHERE id = ?", (t["id"],))
+                    self._event(db, t["id"], actor, role, "status", t["status"], "backlog", now)
+                if t["assignee"] and not self._works_in(t["assignee"], to["id"]):
+                    db.execute("UPDATE tickets SET assignee = NULL WHERE id = ?", (t["id"],))
+                    self._event(db, t["id"], actor, role, "assignee", t["assignee"], None, now)
+                self._sync_epics(db, [t["epic_id"]], actor, role, now)
+            try:
+                return self._links(self.ticket(t["id"]))
+            except ApiError:                            # moved to a project the mover isn't in
+                return {"id": t["id"], "project": to["slug"], "moved": True,
+                        "note": f"moved to {to['slug']}, a project you're not in: it's in their backlog now"}
         if "assignee" in fields:
-            fields["assignee"] = self._check_assignee(fields["assignee"])
+            fields["assignee"] = self._check_assignee(fields["assignee"], self.ticket(tid)["project_id"])
         if "epic_id" in fields:
             fields["epic_id"] = self._check_epic(fields["epic_id"])
         with self.write_lock:
@@ -821,6 +1204,7 @@ class Store:
     def put_checklist(self, tid, text, actor, role):
         """The agent working a ticket reports its checklist: the whole file, replacing the last upload."""
         t = self.ticket(tid)
+        self._check_worker(t["project_id"])
         if role != "agent":
             raise ApiError(403, "checklists are reported by the agent working the ticket; ask it in a comment")
         if not t["assignee"] or t["assignee"].lower() != actor.lower():
@@ -859,6 +1243,7 @@ class Store:
         marked cancelled. An epic takes its unfinished tickets with it. Humans only; say why in a comment."""
         if role != "human":
             raise ApiError(403, "only humans cancel tickets")
+        self._check_worker(self.ticket(tid)["project_id"])
         with self.write_lock:
             db = self.db()
             t = self.ticket(tid)
@@ -885,7 +1270,9 @@ class Store:
         tickets' too), at the same time."""
         if role != "human":
             raise ApiError(403, "only humans accept or decline proposals")
-        assignee = self._check_assignee(assignee) if accept and assignee else None
+        pid = self.ticket(tid)["project_id"]
+        self._check_worker(pid, "accept or decline its proposals")
+        assignee = self._check_assignee(assignee, pid) if accept and assignee else None
         if accept and priority not in (None, ""):
             try:
                 priority = int(priority)
@@ -928,6 +1315,7 @@ class Store:
         return self._links(self.ticket(t["id"]))
 
     def add_dep(self, tid, dep, actor, role):
+        self._check_worker(self.ticket(tid)["project_id"])
         with self.write_lock:
             db = self.db()
             t, d = self.ticket(tid), self.ticket(dep)
@@ -943,6 +1331,7 @@ class Store:
         return self.detail(t["id"])
 
     def remove_dep(self, tid, dep, actor, role):
+        self._check_worker(self.ticket(tid)["project_id"])
         with self.write_lock:
             db = self.db()
             t = self.ticket(tid)
@@ -953,7 +1342,7 @@ class Store:
                     self._event(db, t["id"], actor, role, "depends_on", norm_id(dep), None, time.time())
         return self.detail(t["id"])
 
-    def claim_next(self, actor, role, claim):
+    def claim_next(self, actor, role, claim, projects=None):
         """The next ready ticket for this user: assigned to them first, then
         unassigned ones (never someone else's), highest priority and oldest
         first. With claim, it moves to in_progress and is assigned to them in
@@ -961,11 +1350,12 @@ class Store:
         with self.write_lock:
             db = self.db()
             # Only real work: not epics, not proposals, not blocked.
+            work, work_args = self._work_sql("t", projects)   # only projects it works in (and asked for)
             row = db.execute("SELECT id, assignee FROM tickets t WHERE status = 'ready' AND kind = 'ticket' AND proposed = 0 "
-                             "AND (assignee IS NULL OR assignee = ? COLLATE NOCASE) AND NOT EXISTS ("
+                             f"AND {work} AND (assignee IS NULL OR assignee = ? COLLATE NOCASE) AND NOT EXISTS ("
                              "  SELECT 1 FROM deps d JOIN tickets p ON p.id = d.depends_on "
                              "  WHERE d.ticket_id = t.id AND p.status != 'done') "
-                             "ORDER BY assignee IS NULL, priority, created_at LIMIT 1", (actor,)).fetchone()
+                             "ORDER BY assignee IS NULL, priority, created_at LIMIT 1", work_args + [actor]).fetchone()
             if not row:
                 return None
             if claim:
@@ -985,6 +1375,7 @@ class Store:
         if not body:
             raise ApiError(400, "an empty comment")
         t = self.ticket(tid)
+        self._check_worker(t["project_id"], "comment there")
         now = time.time()
         with self.write_lock:
             db = self.db()
@@ -996,6 +1387,7 @@ class Store:
 
     def add_attachment(self, tid, filename, mime, size, stream, comment_id, actor, role, max_bytes):
         t = self.ticket(tid)
+        self._check_worker(t["project_id"], "upload there")
         if comment_id is not None:
             c = self.db().execute("SELECT ticket_id FROM comments WHERE id = ?", (comment_id,)).fetchone()
             if not c or c["ticket_id"] != t["id"]:
@@ -1236,21 +1628,22 @@ class Store:
         return (db.execute("SELECT COALESCE(MAX(id), 0) FROM comments").fetchone()[0],
                 db.execute("SELECT COALESCE(MAX(id), 0) FROM events").fetchone()[0])
 
-    def news_for(self, user, marks, queue=False):
+    def news_for(self, user, marks, queue=False, projects=None):
         """Tickets someone else commented on or changed since `marks` (that are now assigned to `user`,
         including ones just assigned to them), and with `queue`, unassigned tickets made ready since."""
         c0, e0 = marks
         db, out = self.db(), {}
+        work, wa = self._work_sql("t", projects)
         for r in db.execute(
                 "SELECT t.id, t.title, t.status, c.author FROM comments c JOIN tickets t ON t.id = c.ticket_id "
-                "WHERE c.id > ? AND t.assignee = ? COLLATE NOCASE AND c.author != ? COLLATE NOCASE ORDER BY c.id",
-                (c0, user, user)):
+                f"WHERE c.id > ? AND {work} AND t.assignee = ? COLLATE NOCASE AND c.author != ? COLLATE NOCASE "
+                "ORDER BY c.id", [c0] + wa + [user, user]):
             out[r["id"]] = {"id": r["id"], "title": r["title"], "status": r["status"], "why": f"{r['author']} commented"}
         for r in db.execute(
                 "SELECT t.id, t.title, t.status, e.actor, e.field, e.new FROM events e JOIN tickets t ON t.id = e.ticket_id "
-                "WHERE e.id > ? AND e.actor != ? COLLATE NOCASE AND (t.assignee = ? COLLATE NOCASE OR (? AND "
+                f"WHERE e.id > ? AND {work} AND e.actor != ? COLLATE NOCASE AND (t.assignee = ? COLLATE NOCASE OR (? AND "
                 "t.assignee IS NULL AND t.status = 'ready' AND t.kind = 'ticket' AND t.proposed = 0 AND e.new = 'ready')) "
-                "ORDER BY e.id", (e0, user, user, 1 if queue else 0)):
+                "ORDER BY e.id", [e0] + wa + [user, user, 1 if queue else 0]):
             if r["id"] in out:
                 continue
             if r["field"] == "assignee" and (r["new"] or "").lower() == user.lower():
@@ -1262,17 +1655,26 @@ class Store:
             else:
                 why = f"{r['actor']} changed {r['field'].replace('_', ' ')}"
             out[r["id"]] = {"id": r["id"], "title": r["title"], "status": r["status"], "why": why}
-        return list(out.values())
+        return [self._with_project(o) for o in out.values()]
 
-    def work_for(self, user):
+    def _with_project(self, item):
+        """Add the slug of the project a listed ticket is in."""
+        row = self.db().execute("SELECT p.slug FROM tickets t JOIN projects p ON p.id = t.project_id WHERE t.id = ?",
+                                (item["id"],)).fetchone()
+        item["project"] = row[0] if row else None
+        return item
+
+    def work_for(self, user, projects=None):
         """The user's own unblocked in-progress and ready tickets, in the order to do them: highest
         priority first; at the same priority, started before not started, then nearest completion
         (checklist progress), then oldest."""
+        work, wa = self._work_sql("t", projects)
         rows = [dict(r) for r in self.db().execute(
-            "SELECT t.id, t.title, t.status, t.priority, t.created_at, t.checklist_md FROM tickets t "
-            "WHERE t.status IN ('in_progress', 'ready') AND t.kind = 'ticket' AND t.proposed = 0 "
+            "SELECT t.id, t.title, t.status, t.priority, t.created_at, t.checklist_md, pr.slug AS project FROM tickets t "
+            "LEFT JOIN projects pr ON pr.id = t.project_id "
+            f"WHERE t.status IN ('in_progress', 'ready') AND t.kind = 'ticket' AND t.proposed = 0 AND {work} "
             "AND t.assignee = ? COLLATE NOCASE AND NOT EXISTS (SELECT 1 FROM deps d JOIN tickets p "
-            "ON p.id = d.depends_on WHERE d.ticket_id = t.id AND p.status != 'done')", (user,))]
+            "ON p.id = d.depends_on WHERE d.ticket_id = t.id AND p.status != 'done')", wa + [user])]
         out = []
         for r in rows:
             ck = parse_checklist(r.pop("checklist_md")) if r.get("checklist_md") else None
@@ -1292,56 +1694,59 @@ class Store:
             del r["_rank"], r["created_at"]
         return out
 
-    def outstanding(self, user, status, assigned=True):
+    def outstanding(self, user, status, assigned=True, projects=None):
         """Unblocked tickets (not epics or proposals) in `status`: the user's own, or with assigned=False,
         nobody's. Highest priority first, then oldest."""
         who = "t.assignee = ? COLLATE NOCASE" if assigned else "t.assignee IS NULL"
+        work, wa = self._work_sql("t", projects)
         return [dict(r) for r in self.db().execute(
-            f"SELECT t.id, t.title, t.status, t.priority FROM tickets t WHERE t.status = ? AND t.kind = 'ticket' "
-            f"AND t.proposed = 0 AND {who} AND NOT EXISTS (SELECT 1 FROM deps d JOIN tickets p ON p.id = d.depends_on "
-            f"WHERE d.ticket_id = t.id AND p.status != 'done') ORDER BY t.priority, t.created_at",
-            (status, user) if assigned else (status,))]
+            f"SELECT t.id, t.title, t.status, t.priority, pr.slug AS project FROM tickets t "
+            f"LEFT JOIN projects pr ON pr.id = t.project_id WHERE t.status = ? AND t.kind = 'ticket' "
+            f"AND t.proposed = 0 AND {work} AND {who} AND NOT EXISTS (SELECT 1 FROM deps d JOIN tickets p "
+            f"ON p.id = d.depends_on WHERE d.ticket_id = t.id AND p.status != 'done') ORDER BY t.priority, t.created_at",
+            [status] + wa + ([user] if assigned else []))]
 
-    def comments_owed(self, user, tid=None):
+    def comments_owed(self, user, tid=None, projects=None):
         """The user's open tickets (or just `tid`) with comments from humans posted since the user last
         commented there: they stay until the user replies on the ticket. [{"id", "title", "status",
         "new_comments", "from", "why"}], newest activity first."""
+        work, wa = self._work_sql("t", projects)
         sql = ("SELECT t.id, t.title, t.status, COUNT(c.id) AS n, GROUP_CONCAT(DISTINCT c.author) AS who, "
                "MAX(c.id) AS last FROM tickets t JOIN comments c ON c.ticket_id = t.id "
-               "WHERE t.assignee = ? COLLATE NOCASE AND t.kind = 'ticket' AND c.role = 'human' "
+               f"WHERE {work} AND t.assignee = ? COLLATE NOCASE AND t.kind = 'ticket' AND c.role = 'human' "
                "AND c.author != ? COLLATE NOCASE AND c.id > COALESCE((SELECT MAX(m.id) FROM comments m "
                "WHERE m.ticket_id = t.id AND m.author = ? COLLATE NOCASE), 0)")
-        args = [user, user, user]
+        args = wa + [user, user, user]
         if tid:
             sql += " AND t.id = ?"
             args.append(tid)
         out = []
         for r in self.db().execute(sql + " GROUP BY t.id ORDER BY last DESC", args):
             who = ", ".join(sorted(set((r["who"] or "").split(","))))
-            out.append({"id": r["id"], "title": r["title"], "status": r["status"], "new_comments": r["n"],
-                        "from": who.split(", "),
-                        "why": f"{who} commented ({r['n']} new): read it and reply on the ticket"})
+            out.append(self._with_project({"id": r["id"], "title": r["title"], "status": r["status"],
+                                           "new_comments": r["n"], "from": who.split(", "),
+                                           "why": f"{who} commented ({r['n']} new): read it and reply on the ticket"}))
         return out
 
-    def wait_for(self, user, timeout, queue=False):
+    def wait_for(self, user, timeout, queue=False, projects=None):
         """What `user` should do next, as soon as there's anything: chat they owe; humans' comments on
         their tickets they haven't replied to; other changes to their tickets since the call began; their
         in-progress and ready tickets; with `queue`, anyone's ready tickets. Only when there's none of that
         does it wait (up to `timeout` seconds)."""
         marks, end = self._marks(), time.time() + timeout
-        steps = [("queue", lambda: self.outstanding(user, "ready", assigned=False) if queue else [],
+        steps = [("queue", lambda: self.outstanding(user, "ready", assigned=False, projects=projects) if queue else [],
                   "ready for anyone: take it with POST /api/next")]
         while True:
             notice = self.chat_notice(user)
             if notice:
                 return {"reason": "chat", "chat": notice, "tickets": []}
-            owed = self.comments_owed(user)
+            owed = self.comments_owed(user, projects=projects)
             if owed:
                 return {"reason": "comments", "chat": None, "tickets": owed}
-            news = self.news_for(user, marks, queue)
+            news = self.news_for(user, marks, queue, projects)
             if news:
                 return {"reason": "tickets", "chat": None, "tickets": news}
-            work = self.work_for(user)
+            work = self.work_for(user, projects)
             if work:  # "in_progress" or "ready", after the first thing to do
                 return {"reason": work[0]["status"], "chat": None, "tickets": work}
             for reason, find, why in steps:
@@ -1645,12 +2050,14 @@ def export_archive(store, dest):
     db.row_factory = sqlite3.Row
     try:
         db.execute("BEGIN")
-        tables = {t: [dict(r) for r in db.execute(f"SELECT * FROM {t} ORDER BY rowid")] for t in TABLES}
+        have = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        # A board from before a table existed (backed up by --upgrade before it changes anything): left out
+        tables = {t: [dict(r) for r in db.execute(f"SELECT * FROM {t} ORDER BY rowid")] for t in TABLES if t in have}
         schema = db.execute("PRAGMA user_version").fetchone()[0]
         db.execute("COMMIT")
     finally:
         db.close()
-    paths = [a["path"] for a in tables["attachments"]] + [f["path"] for f in tables["chat_files"]]
+    paths = [a["path"] for a in tables.get("attachments", [])] + [f["path"] for f in tables.get("chat_files", [])]
     missing = [p for p in paths if not (store.files / p).is_file()]
     doc = {"format": EXPORT_FORMAT, "version": EXPORT_VERSION, "schema_version": schema,
            "exported_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "statuses": STATUSES,
@@ -1719,11 +2126,15 @@ def import_archive(store, src, replace=False):
             # already exist here); a backup without any (older ones) leaves the
             # users here alone, so nobody gets locked out by a restore.
             backup_users = doc["tables"].get("users") or []
+            backup_projects = doc["tables"].get("projects") or []
             with db:
                 if replace:
                     for t in reversed(TABLES):
                         if t != "users" or backup_users:
                             db.execute(f"DELETE FROM {t}")
+                if backup_projects:                 # the backup's projects (general included) replace this board's
+                    db.execute("DELETE FROM project_members")
+                    db.execute("DELETE FROM projects")
                 for t in TABLES:
                     cols = {r[1] for r in db.execute(f"PRAGMA table_info({t})")}
                     rows = doc["tables"].get(t, [])
@@ -1735,9 +2146,15 @@ def import_archive(store, src, replace=False):
                             keep.pop("id", None)
                             if db.execute("SELECT 1 FROM users WHERE username = ?", (keep.get("username"),)).fetchone():
                                 continue
-                        verb = "INSERT OR REPLACE" if t == "settings" else "INSERT"
+                        verb = "INSERT OR REPLACE" if t in ("settings", "project_members") else "INSERT"
                         db.execute(f"{verb} INTO {t} ({', '.join(keep)}) VALUES ({', '.join('?' * len(keep))})",
                                    list(keep.values()))
+                if not db.execute("SELECT 1 FROM projects WHERE slug = ?", (GENERAL,)).fetchone():
+                    db.execute("INSERT INTO projects (slug, name, description, created_by, created_at) VALUES (?,?,?,?,?)",
+                               (GENERAL, "General", "Everything not filed under another project.", "hearthboard",
+                                time.time()))
+                if not backup_projects:             # from before projects: as --upgrade does it
+                    store._into_general(db, humans_global=True)
             # Files: only regular files under files/, never outside the data folder.
             root = store.files.resolve()
             restored = 0
@@ -4301,9 +4718,9 @@ def what_now(t, me):
 
 
 # What each request body may contain.
-TICKET_NEW = ("title", "description", "status", "priority", "assignee", "kind", "epic_id", "depends_on")
-TICKET_EDIT = ("title", "description", "status", "priority", "assignee", "epic_id")
-WIKI_FIELDS = ("title", "body", "parent", "slug")
+TICKET_NEW = ("title", "description", "status", "priority", "assignee", "kind", "epic_id", "depends_on", "project")
+TICKET_EDIT = ("title", "description", "status", "priority", "assignee", "epic_id", "project")
+WIKI_FIELDS = ("title", "body", "parent", "slug", "project")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -4502,6 +4919,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             role, actor, bearer = self.who(query)
             self.who_is = (role, actor)
+            store.set_viewer(actor, role)       # everything below sees only what this caller can
             # The briefing is public (it's only documentation); with a token
             # it adds who's asking and what's waiting. An agent calling the
             # base URL with its token gets it too, instead of the web page.
@@ -4574,7 +4992,8 @@ class Handler(BaseHTTPRequestHandler):
                 t = (query.get("timeout") or ["50"])[0]
                 timeout = max(1, min(300, int(t) if t.isdigit() else 50))
                 queue = (query.get("queue") or [""])[0] in ("1", "true", "yes")
-                return self.json(200, store.wait_for(actor, timeout, queue))
+                want = (query.get("project") or [""])[0]
+                return self.json(200, store.wait_for(actor, timeout, queue, store.project_ids(want) if want else None))
             if path.startswith("/api/chat"):
                 return self.chat_api(method, path, query, actor, role)
             if method == "GET" and path == "/api/skill":
@@ -4604,6 +5023,30 @@ class Handler(BaseHTTPRequestHandler):
                     return self.json(200, store.wiki_update(sub, self.body_json(WIKI_FIELDS), actor, role))
                 if method == "DELETE" and sub:
                     return self.json(200, store.wiki_delete(sub, actor, role))
+            pm = re.fullmatch(r"/api/projects(?:/([a-z0-9-]+))?(/members|/archive)?(?:/([^/]+))?", path)
+            if pm:
+                slug, sub, who_ = pm.group(1), pm.group(2), pm.group(3)
+                if not slug and method == "GET":
+                    return self.json(200, {"projects": store.projects()})
+                if not slug and method == "POST":
+                    return self.json(201, store.create_project(self.body_json(("name", "slug", "description")), actor))
+                if slug and not sub and method == "GET":
+                    return self.json(200, {**store.project(slug), "members": store.members(slug)})
+                if slug and not sub and method == "PATCH":
+                    return self.json(200, store.update_project(slug, self.body_json(("name", "description")), actor))
+                if slug and sub == "/archive" and method == "POST" and not who_:
+                    d = self.body_json(("archived",))
+                    return self.json(200, store.archive_project(slug, d.get("archived", True) is not False))
+                if slug and sub == "/members" and method == "GET" and not who_:
+                    return self.json(200, {"members": store.members(slug)})
+                if slug and sub == "/members" and method == "PUT" and who_:
+                    if role != "human":
+                        raise ApiError(403, "only humans manage project members")
+                    d = self.body_json(("role",))
+                    if "role" not in d:
+                        raise ApiError(400, 'send {"role": "admin" | "member" | "viewer"}, or {"role": null} to take them out')
+                    return self.json(200, {"members": store.set_member(slug, unquote(who_), d["role"], actor)})
+                raise ApiError(404, "not found")
             um = re.fullmatch(r"/api/users(?:/([^/]+))?(/token)?", path)
             if method == "GET" and path == "/users":
                 if role != "human":
@@ -4646,32 +5089,41 @@ class Handler(BaseHTTPRequestHandler):
                 name, tok = um.group(1), um.group(2)
                 if not name and method == "GET":
                     return self.json(200, {"users": store.users()})
+                # Account work (adding users, tokens, disabling, global admins) is the global admins' job;
+                # project admins add existing accounts to their projects.
+                if method != "GET" and not store.is_global_admin():
+                    raise ApiError(403, "only global admins manage accounts (a project's admins add existing "
+                                        "accounts to it: PUT /api/projects/SLUG/members/NAME)")
                 if not name and method == "POST":
-                    d = self.body_json(("username", "kind"))
-                    user, token = store.add_user(d.get("username"), d.get("kind") or "agent", actor)
+                    d = self.body_json(("username", "kind", "global_admin"))
+                    user, token = store.add_user(d.get("username"), d.get("kind") or "agent", actor,
+                                                 global_admin=bool(d.get("global_admin")))
                     return self.json(201, {"user": user, "token": token})
                 if name and tok and method == "POST":
                     return self.json(200, {"user": store.user(name), "token": store.new_user_token(name)})
                 if name and not tok and method == "PATCH":
-                    d = self.body_json(("disabled", "guidance"))
-                    if "disabled" not in d and "guidance" not in d:
-                        raise ApiError(400, 'send {"disabled": true|false} and/or {"guidance": "notes for this user"}')
+                    d = self.body_json(("disabled", "guidance", "global_admin"))
+                    if not d:
+                        raise ApiError(400, 'send {"disabled": true|false}, {"global_admin": true|false} and/or '
+                                            '{"guidance": "notes for this user"}')
                     if "guidance" in d:
                         store.set_user_guidance(name, d["guidance"])
+                    if "global_admin" in d:
+                        store.set_global_admin(name, bool(d["global_admin"]))
                     if "disabled" in d:
                         store.set_disabled(name, bool(d["disabled"]))
                     return self.json(200, store.user(name))
                 if name and not tok and method == "GET":
                     return self.json(200, store.user(name))
             if method == "GET" and path == "/api/export":
-                if role != "human":
-                    raise ApiError(403, "only humans can export")
+                if role != "human" or not store.is_global_admin():
+                    raise ApiError(403, "only global admins can export (a backup holds every project)")
                 return self.serve_export()
             if path == "/api/next" and method == "GET":
                 raise ApiError(405, "take a ticket with POST /api/next; to see what to do, GET /api/wait")
             if path == "/api/next" and method == "POST":
-                self.body_json(())
-                t = store.claim_next(actor, role, True)
+                want = self.body_json(("project",)).get("project") or (query.get("project") or [""])[0]
+                t = store.claim_next(actor, role, True, store.project_ids(want) if want else None)
                 out = {"ticket": t, "guidance": store.guidance_for(actor)}
                 started = [w for w in store.work_for(actor) if w["status"] == "in_progress" and (not t or w["id"] != t["id"])]
                 if started:
@@ -4691,10 +5143,12 @@ class Handler(BaseHTTPRequestHandler):
                     elif who == "none":
                         who = ""
                     prop = (query.get("proposed") or [None])[0]
+                    want = (query.get("project") or [""])[0]
                     return self.json(200, {"tickets": store.tickets(
                         st or None, (query.get("q") or [""])[0] or None, assignee=who,
                         kind=(query.get("kind") or [None])[0], epic=(query.get("epic") or [None])[0],
-                        proposed=None if prop is None else prop in ("1", "true", "yes"))})
+                        proposed=None if prop is None else prop in ("1", "true", "yes"),
+                        projects=store.project_ids(want) if want else None)})
                 if method == "POST":
                     return self.json(201, store.create(self.body_json(TICKET_NEW), actor, role))
             if m:
@@ -5002,9 +5456,10 @@ def cmd_service(argv):
 
 
 def make_server(host, port, data_dir, max_upload_mb=1024):
+    store = Store(data_dir)           # before the port: an old board refuses (run --upgrade) without binding it
     srv = ThreadingHTTPServer((host, port), Handler)
     srv.daemon_threads = True
-    srv.store = Store(data_dir)
+    srv.store = store
     srv.max_upload = max_upload_mb << 20
     return srv
 
@@ -5019,6 +5474,10 @@ def main():
     ap.add_argument("--max-upload-mb", type=int, default=int(setting_env("MAX_UPLOAD_MB", 1024)))
     ap.add_argument("--add-user", metavar="NAME", help="add a user, print their token, and exit")
     ap.add_argument("--kind", choices=KINDS, default="agent", help="with --add-user: human or agent (default agent)")
+    ap.add_argument("--global-admin", action="store_true",
+                    help="with --add-user (a human): admin of every project, and does the account work")
+    ap.add_argument("--upgrade", action="store_true",
+                    help="bring a board made by an older hearthboard up to date (backs it up first), and exit")
     ap.add_argument("--new-token", metavar="NAME", help="give a user a new token (the old one stops working) and exit")
     ap.add_argument("--disable", metavar="NAME", help="disable a user and exit")
     ap.add_argument("--enable", metavar="NAME", help="re-enable a user and exit")
@@ -5029,6 +5488,37 @@ def main():
     ap.add_argument("--import", dest="import_", metavar="FILE", help="restore a backup into the data folder and exit")
     ap.add_argument("--replace", action="store_true", help="with --import: delete the tickets already there first")
     a = ap.parse_args()
+    try:
+        return run_command(a)
+    except NeedsUpgrade as e:
+        sys.exit(str(e))
+
+
+def upgrade_board(data):
+    """--upgrade: back the board up into its own folder, then bring it up to date. Returns (backup, what changed)."""
+    data = Path(data)
+    if not (data / "tickets.db").is_file():
+        raise NeedsUpgrade(f"{data} has no board yet: nothing to upgrade")
+    with closing(sqlite3.connect(data / "tickets.db")) as db:
+        version = db.execute("PRAGMA user_version").fetchone()[0]
+    if version >= SCHEMA_VERSION:
+        raise NeedsUpgrade(f"{data} is already up to date (schema {version}): nothing to upgrade")
+    old = SimpleNamespace(db_path=data / "tickets.db", files=data / "files")
+    backup = data / time.strftime(f"before-upgrade-{SCHEMA_VERSION}-%Y%m%d-%H%M%S.tar.gz")
+    export_archive(old, backup)
+    store = Store(data, upgrade=True)
+    return backup, store.upgraded
+
+
+def run_command(a):
+    if a.upgrade:
+        backup, done = upgrade_board(a.data)
+        print(f"Backed up to {backup} first. Upgraded to schema {SCHEMA_VERSION}: {done['tickets']} tickets and "
+              f"{done['wiki_pages']} wiki pages are in the project \"{GENERAL}\"; {done['global_admins']} human"
+              f"{'s' if done['global_admins'] != 1 else ''} made global admin{'s' if done['global_admins'] != 1 else ''} "
+              f"(admins of every project); agents are members of {GENERAL} and guests its viewers. Add projects on "
+              f"the Projects page or with POST /api/projects.")
+        return
     if a.export:
         dest, counts, pruned = export_to(Store(a.data), a.export, a.keep)
         print(f"Backed up to {dest}: " + ", ".join(f"{n} {t}" for t, n in counts.items())
@@ -5045,7 +5535,9 @@ def main():
         store = Store(a.data)
         try:
             if a.add_user:
-                u, token = store.add_user(a.add_user, a.kind, "command line")
+                if a.global_admin and a.kind != "human":
+                    sys.exit("--global-admin is for humans: add --kind human")
+                u, token = store.add_user(a.add_user, a.kind, "command line", global_admin=a.global_admin)
                 print(f"Added {u['kind']} {u['username']}. Their token (shown once):\n{token}")
                 if u["kind"] == "agent":
                     print(f"To run it with hobkin, on the machine it'll work on:\n"

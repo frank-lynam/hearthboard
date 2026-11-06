@@ -135,8 +135,8 @@ class TicketsTest(unittest.TestCase):
         store = self.srv.store
         now = time.time()
         with store.db() as db:
-            db.execute("INSERT INTO tickets (id, title, status, created_at, updated_at) VALUES ('KAMO', 'old one', 'done', ?, ?)",
-                       (now, now))
+            db.execute("INSERT INTO tickets (id, title, status, created_at, updated_at, project_id) VALUES "
+                       "('KAMO', 'old one', 'done', ?, ?, (SELECT id FROM projects WHERE slug = 'general'))", (now, now))
         self.assertEqual(self.j("GET", "/api/tickets/kamo")[1]["title"], "old one")
         self.assertEqual(self.call("GET", "/t/KAMO", role="human")[0], 200)
         # Old and new ids together, as dependencies, in a string with commas and spaces.
@@ -502,9 +502,13 @@ class TicketsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = at.Store(Path(tmp) / "data")
             store.add_user("only", "human", "test")
+            self.assertTrue(store.user("only")["global_admin"])   # the first human runs the board
             with self.assertRaises(at.ApiError):
                 store.set_disabled("only", True)
             store.add_user("second", "human", "test")
+            with self.assertRaises(at.ApiError):   # another human isn't enough: someone must be a global admin
+                store.set_disabled("only", True)
+            store.set_global_admin("second", True)
             self.assertTrue(store.set_disabled("only", True)["disabled"])
 
     def test_briefing(self):
@@ -1692,7 +1696,8 @@ class TicketsTest(unittest.TestCase):
         brief = self.call("GET", "/api", role=None)[1].decode()
         self.assertLess(brief.index("GET /api/skill"), brief.index("## Signing in"))  # up front
 
-    def test_old_database_upgrades(self):
+    def test_old_database_needs_an_upgrade(self):
+        # A board from long before (schema 1): this version won't open it on its own; --upgrade does.
         with tempfile.TemporaryDirectory() as tmp:
             data = Path(tmp) / "data"
             data.mkdir()
@@ -1704,8 +1709,12 @@ class TicketsTest(unittest.TestCase):
               INSERT INTO tickets VALUES ('KAMI', 'old', '', 'ready', 2, NULL, 'frank', 1, 1);
               PRAGMA user_version = 1;""")
             db.close()
-            store = at.Store(data)
+            with self.assertRaises(at.NeedsUpgrade) as e:
+                at.Store(data)
+            self.assertIn("--upgrade", str(e.exception))
+            store = at.Store(data, upgrade=True)
             self.assertIsNone(store.ticket("KAMI")["assignee"])
+            self.assertEqual(store.ticket("KAMI")["project"], "general")
             self.assertEqual(store.db().execute("PRAGMA user_version").fetchone()[0], at.SCHEMA_VERSION)
 
     # --- pages
@@ -1722,6 +1731,235 @@ class TicketsTest(unittest.TestCase):
         self.assertIn("Needs your review", self.call("GET", "/", role="human")[1].decode())
         self.assertEqual(self.call("GET", "/t/ZZZZ", role="human")[0], 404)
 
+
+
+class ProjectsTest(unittest.TestCase):
+    """One project per team: what each person and agent can see and do, on a board with records and legal."""
+    FIXTURES = Path(__file__).resolve().parent / "fixtures"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.srv = at.make_server("127.0.0.1", 0, Path(cls.tmp.name) / "data", max_upload_mb=1)
+        cls.url = f"http://127.0.0.1:{cls.srv.server_address[1]}"
+        st = cls.srv.store
+        cls.keys = {}
+        for name, kind in (("boss", "human"), ("alice", "human"), ("bob", "human"), ("carl", "human"),
+                           ("rita", "agent"), ("lena", "agent"), ("gus", "guest")):
+            cls.keys[name] = st.add_user(name, kind, "test")[1]
+        st.create_project({"name": "Records", "slug": "records"}, "boss")
+        st.create_project({"name": "Legal", "slug": "legal"}, "boss")
+        for slug, who, role in (("records", "alice", "admin"), ("records", "rita", "member"), ("records", "carl", "viewer"),
+                                ("legal", "bob", "member"), ("legal", "lena", "member")):
+            st.set_member(slug, who, role, "boss")
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+        cls.srv.server_close()
+        cls.tmp.cleanup()
+
+    def j(self, method, path, body=None, who="boss"):
+        h = {"Authorization": "Bearer " + self.keys[who]}
+        data = None
+        if body is not None:
+            data, h["Content-Type"] = json.dumps(body).encode(), "application/json"
+        req = urllib.request.Request(self.url + path, data=data, method=method, headers=h)
+        try:
+            with urllib.request.urlopen(req) as r:
+                raw = r.read()
+                return r.status, json.loads(raw) if raw[:1] in (b"{", b"[") else raw.decode()
+        except urllib.error.HTTPError as e:
+            raw = e.read()
+            return e.code, json.loads(raw) if raw[:1] == b"{" else raw.decode()
+
+    def ticket(self, project, who="boss", **kw):
+        code, t = self.j("POST", "/api/tickets", {"title": kw.pop("title", f"a {project} job"), "project": project,
+                                                  "status": kw.pop("status", "ready"), **kw}, who)
+        self.assertEqual(code, 201, t)
+        return t
+
+    def test_reads_are_scoped(self):
+        t = self.ticket("records", title="Records only")
+        self.j("POST", f"/api/tickets/{t['id']}/comments", {"body": "a note"}, "alice")
+        self.assertEqual(self.j("GET", f"/api/tickets/{t['id']}", who="alice")[1]["project"], "records")
+        for who in ("bob", "lena"):                       # outside the project: as if it weren't there
+            self.assertEqual(self.j("GET", f"/api/tickets/{t['id']}", who=who)[0], 404)
+            self.assertEqual(self.j("GET", f"/api/tickets/{t['id']}/comments?before=999999", who=who)[0], 404)
+            ids = [x["id"] for x in self.j("GET", "/api/tickets?q=Records%20only", who=who)[1]["tickets"]]
+            self.assertNotIn(t["id"], ids)
+            self.assertEqual(self.j("GET", "/api/projects/records", who=who)[0], 404)
+        self.assertIn(t["id"], [x["id"] for x in self.j("GET", "/api/tickets?q=Records%20only", who="carl")[1]["tickets"]])
+        self.assertEqual(self.j("GET", f"/t/{t['id']}", who="bob")[0], 404)
+        # the project filter, and the projects each one sees
+        self.assertEqual({x["project"] for x in self.j("GET", "/api/tickets?project=records", who="boss")[1]["tickets"]},
+                         {"records"})
+        self.assertEqual({p["slug"] for p in self.j("GET", "/api/projects", who="bob")[1]["projects"]}, {"general", "legal"})
+        self.assertLessEqual({"general", "legal", "records"},
+                             {p["slug"] for p in self.j("GET", "/api/projects", who="boss")[1]["projects"]})
+
+    def test_files_are_scoped(self):
+        t = self.ticket("legal")
+        req = urllib.request.Request(self.url + f"/api/tickets/{t['id']}/attachments?filename=n.txt", data=b"secret",
+                                     method="POST", headers={"Authorization": "Bearer " + self.keys["bob"]})
+        with urllib.request.urlopen(req) as r:
+            a = json.loads(r.read())
+        self.assertEqual(self.j("GET", a["url"], who="bob")[0], 200)
+        self.assertEqual(self.j("GET", a["url"], who="alice")[0], 404)
+
+    def test_viewers_read_and_outsiders_cant_write(self):
+        t = self.ticket("records")
+        self.assertEqual(self.j("POST", f"/api/tickets/{t['id']}/comments", {"body": "hi"}, "carl")[0], 403)   # viewer
+        self.assertEqual(self.j("PATCH", f"/api/tickets/{t['id']}", {"title": "x"}, "carl")[0], 403)
+        self.assertEqual(self.j("POST", "/api/tickets", {"title": "x", "project": "records"}, "carl")[0], 403)
+        self.assertEqual(self.j("POST", f"/api/tickets/{t['id']}/comments", {"body": "hi"}, "bob")[0], 404)   # outsider
+        self.assertEqual(self.j("POST", "/api/tickets", {"title": "x", "project": "records"}, "bob")[0], 404)
+        # a ticket with no project lands in general
+        self.assertEqual(self.j("POST", "/api/tickets", {"title": "loose"}, "alice")[1]["project"], "general")
+        # assigning: only to someone who works in that project
+        self.assertEqual(self.j("PATCH", f"/api/tickets/{t['id']}", {"assignee": "lena"}, "boss")[0], 400)
+        self.assertEqual(self.j("PATCH", f"/api/tickets/{t['id']}", {"assignee": "rita"}, "boss")[0], 200)
+
+    def test_agents_work_only_their_projects(self):
+        legal = self.ticket("legal", title="legal work", priority=1)
+        recs = self.ticket("records", title="records work", priority=3)
+        code, got = self.j("POST", "/api/next", {}, "rita")
+        self.assertEqual(got["ticket"]["id"], recs["id"])            # never legal's, even at a higher priority
+        self.assertEqual(self.j("GET", "/api/wait?timeout=1&queue=1", who="rita")[1]["tickets"][0]["project"], "records")
+        waited = self.j("GET", "/api/wait?timeout=1&queue=1", who="lena")[1]
+        self.assertNotIn(recs["id"], json.dumps(waited))
+        self.assertEqual(waited["tickets"][0]["id"], legal["id"])
+        # the project filter narrows further; a project it can't see is 404
+        self.assertIsNone(self.j("POST", "/api/next", {"project": "general"}, "lena")[1]["ticket"])
+        self.assertEqual(self.j("POST", "/api/next", {"project": "records"}, "lena")[0], 404)
+        self.assertEqual(self.j("POST", "/api/next", {"project": "legal"}, "lena")[1]["ticket"]["id"], legal["id"])
+
+    def test_proposals_land_in_their_project(self):
+        code, p = self.j("POST", "/api/tickets", {"title": "rita's idea", "project": "records"}, "rita")
+        self.assertEqual((code, p["proposed"], p["project"]), (201, 1, "records"))
+        self.assertIn(p["id"], [t["id"] for t in self.j("GET", "/api/tickets?proposed=1", who="alice")[1]["tickets"]])
+        self.assertNotIn(p["id"], [t["id"] for t in self.j("GET", "/api/tickets?proposed=1", who="bob")[1]["tickets"]])
+        self.assertEqual(self.j("POST", f"/api/tickets/{p['id']}/accept", {}, "bob")[0], 404)
+        self.assertEqual(self.j("POST", f"/api/tickets/{p['id']}/accept", {}, "carl")[0], 403)    # a viewer
+        self.assertEqual(self.j("POST", f"/api/tickets/{p['id']}/accept", {"ready": True}, "alice")[0], 200)
+
+    def test_roles(self):
+        # a project admin: its members, not accounts, tokens or projects
+        self.assertEqual(self.j("POST", "/api/users", {"username": "x1", "kind": "agent"}, "alice")[0], 403)
+        self.assertEqual(self.j("POST", "/api/users/rita/token", {}, "alice")[0], 403)
+        self.assertEqual(self.j("POST", "/api/projects", {"name": "Mine"}, "alice")[0], 403)
+        self.assertEqual(self.j("PUT", "/api/projects/legal/members/rita", {"role": "member"}, "alice")[0], 404)
+        self.assertEqual(self.j("PUT", "/api/projects/records/members/bob", {"role": "viewer"}, "alice")[0], 200)
+        self.assertEqual(self.j("PUT", "/api/projects/records/members/bob", {"role": None}, "alice")[0], 200)
+        self.assertEqual(self.j("PUT", "/api/projects/records/members/rita", {"role": "admin"}, "alice")[0], 400)  # agent
+        self.assertEqual(self.j("PUT", "/api/projects/records/members/gus", {"role": "member"}, "alice")[0], 400)  # guest
+        self.assertEqual(self.j("PATCH", "/api/projects/records", {"name": "Records team"}, "alice")[1]["name"], "Records team")
+        # a global admin: all of it
+        code, made = self.j("POST", "/api/users", {"username": "newbie", "kind": "agent"}, "boss")
+        self.assertEqual(code, 201)
+        self.assertEqual(made["user"]["projects"], {"general": "member"})
+        self.assertEqual(self.j("POST", "/api/users", {"username": "ag", "kind": "agent", "global_admin": True}, "boss")[0], 400)
+        self.assertEqual(self.j("PATCH", "/api/users/boss", {"disabled": True}, "boss")[0], 409)   # the last global admin
+        self.assertEqual(self.j("PATCH", "/api/users/boss", {"global_admin": False}, "boss")[0], 409)
+        self.assertEqual(self.j("GET", "/api/export", who="alice")[0], 403)
+
+    def test_moves(self):
+        t = self.ticket("records", assignee="rita")
+        self.assertEqual(self.j("PATCH", f"/api/tickets/{t['id']}", {"project": "legal"}, "rita")[0], 403)   # an agent
+        self.assertEqual(self.j("PATCH", f"/api/tickets/{t['id']}", {"project": "legal"}, "carl")[0], 403)   # a viewer
+        self.assertEqual(self.j("PATCH", f"/api/tickets/{t['id']}", {"project": "general"}, "bob")[0], 404)  # outside
+        code, moved = self.j("PATCH", f"/api/tickets/{t['id']}", {"project": "legal"}, "alice")   # to a project she's not in
+        self.assertEqual((code, moved.get("moved"), moved["project"]), (200, True, "legal"))
+        got = self.j("GET", f"/api/tickets/{t['id']}", who="bob")[1]
+        self.assertEqual((got["project"], got["status"], got["assignee"]), ("legal", "backlog", None))
+        self.assertIn(("project", "alice", "records", "legal"),
+                      [(e["field"], e["actor"], e["old"], e["new"]) for e in got["events"]])
+        self.assertEqual(self.j("GET", f"/api/tickets/{t['id']}", who="alice")[0], 404)
+
+    def test_epics_and_dependencies_cross_projects(self):
+        e = self.ticket("general", title="Big plan", kind="epic", status="backlog")
+        a = self.ticket("records", title="records part", epic_id=e["id"])
+        b = self.ticket("legal", title="SECRET legal part", epic_id=e["id"])
+        got = self.j("GET", f"/api/tickets/{e['id']}", who="rita")[1]          # rita isn't in general's... she is;
+        self.assertEqual((got["progress"]["total"], got["progress"]["hidden"]), (1, 1))
+        self.assertNotIn("SECRET", json.dumps(got))
+        # someone who sees only one ticket in an epic still sees the epic
+        self.j("PUT", "/api/projects/general/members/bob", {"role": None}, "boss")
+        self.assertEqual(self.j("GET", f"/api/tickets/{e['id']}", who="bob")[0], 200)
+        # a dependency across projects blocks, and shows no title to those who can't see it
+        self.assertEqual(self.j("POST", f"/api/tickets/{a['id']}/deps", {"depends_on": b["id"]}, "boss")[0], 200)
+        seen = self.j("GET", f"/api/tickets/{a['id']}", who="rita")[1]
+        self.assertEqual(seen["depends_on"][0]["title"], "a ticket in another project")
+        self.assertNotIn("SECRET", json.dumps(seen))
+        self.assertTrue(seen["blocked"])
+        self.assertEqual(self.j("POST", f"/api/tickets/{b['id']}/deps", {"depends_on": a["id"]}, "boss")[0], 409)  # a loop
+        self.j("PUT", "/api/projects/general/members/bob", {"role": "member"}, "boss")
+
+    def test_removed_members_tickets_are_unassigned(self):
+        st = self.srv.store
+        st.add_user("temp", "agent", "test")
+        st.set_member("records", "temp", "member", "boss")
+        t = self.ticket("records", assignee="temp")
+        self.j("PUT", "/api/projects/records/members/temp", {"role": None}, "alice")
+        got = self.j("GET", f"/api/tickets/{t['id']}", who="alice")[1]
+        self.assertIsNone(got["assignee"])
+        self.assertIn(("assignee", "temp", None), [(e["field"], e["old"], e["new"]) for e in got["events"]])
+
+    def test_archived_projects(self):
+        self.j("POST", "/api/projects", {"name": "Old team", "slug": "old-team"}, "boss")
+        self.j("PUT", "/api/projects/old-team/members/alice", {"role": "member"}, "boss")
+        t = self.ticket("old-team", who="alice")
+        self.assertEqual(self.j("POST", "/api/projects/old-team/archive", {}, "boss")[1]["archived"], 1)
+        self.assertEqual(self.j("POST", "/api/tickets", {"title": "more", "project": "old-team"}, "alice")[0], 409)
+        self.assertEqual(self.j("GET", f"/api/tickets/{t['id']}", who="alice")[0], 200)     # still readable
+        self.assertEqual(self.j("PATCH", f"/api/tickets/{self.ticket('records')['id']}", {"project": "old-team"},
+                                "boss")[0], 409)
+        self.assertEqual(self.j("POST", "/api/projects/general/archive", {}, "boss")[0], 409)
+
+    # --- upgrading a board made by 0.1.2, and importing its export (fixtures made with that version)
+    def test_upgrade_from_0_1_2(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp) / "board"
+            data.mkdir()
+            import shutil as _shutil
+            _shutil.copy(self.FIXTURES / "board-0.1.2.db", data / "tickets.db")
+            run = lambda *a: subprocess.run([sys.executable, at.__file__, "--data", str(data), *a],
+                                            capture_output=True, text=True, timeout=60)
+            r = run("--list-users")                       # this version won't open it as it is
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("--upgrade", r.stderr)
+            r = run("--upgrade")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("Backed up to", r.stdout)
+            self.assertEqual(len(list(data.glob("before-upgrade-*.tar.gz"))), 1)
+            st = at.Store(data)
+            self.assertEqual({t["project"] for t in st.tickets(limit=100)}, {"general"})
+            users = {u["username"]: u for u in st.users()}
+            self.assertTrue(users["frank"]["global_admin"])
+            self.assertEqual((users["bodkin"]["projects"], users["visitor"]["projects"]),
+                             ({"general": "member"}, {"general": "viewer"}))
+            self.assertEqual(st.ticket("clear-cushion")["title"], "First job")
+            r = run("--upgrade")                          # a second run refuses
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("already up to date", r.stderr)
+
+    def test_import_and_round_trip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old = at.Store(Path(tmp) / "from-old")        # an export from before projects: into general
+            at.import_archive(old, self.FIXTURES / "export-0.1.2.tar.gz")
+            self.assertEqual({t["project"] for t in old.tickets(limit=100)}, {"general"})
+            self.assertTrue(old.user("frank")["global_admin"])
+            self.assertEqual(old.user("bodkin")["projects"], {"general": "member"})
+            # a round trip keeps projects, members, roles and the global admin flag
+            dest = Path(tmp) / "b.tar.gz"
+            at.export_archive(self.srv.store, dest)
+            new = at.Store(Path(tmp) / "copy")
+            at.import_archive(new, dest)
+            self.assertEqual({p["slug"] for p in new.projects()} >= {"general", "records", "legal"}, True)
+            self.assertEqual(new.user("alice")["projects"]["records"], "admin")
+            self.assertTrue(new.user("boss")["global_admin"])
+            self.assertFalse(new.user("alice")["global_admin"])
 
 
 class DataFolderTest(unittest.TestCase):

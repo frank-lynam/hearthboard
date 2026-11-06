@@ -41,5 +41,5 @@ hearthboard = "hearthboard:cli"
 name = "hearthboard"
 
 [tool.flit.sdist]
-include = ["test_hearthboard.py"]
+include = ["test_hearthboard.py", "fixtures/"]
 exclude = ["CLAUDE.md", "AGENTS.md", "data/"]
