@@ -27,13 +27,17 @@ read `GET /api` on the running server instead.
   assigned to the ticket while it's in progress, replacing the last upload;
   the server never reads files from disk paths, and nobody edits checklists
   on the server. Only
-  humans manage users or export; the last active human can't be disabled.
+  global admins manage accounts or export; the last active human, and the last active global admin,
+  can't be disabled. **Projects scope everything:** each request sees only the caller's projects
+  (`Store.set_viewer`, set per request in `Handler.route`); anything outside them is 404, never 403.
+  Agents work (claim, wait, are told about) only projects they're members of, never ones they view.
   Tokens are stored only as hashes and never appear in logs or backups.
 - **Data** lives in `$HEARTHBOARD_DATA`, else `~/.local/share/hearthboard`
   (`default_data_dir()`): `tickets.db` (tickets and
-  users) and `files/`. Schema changes must keep existing databases working:
-  `CREATE TABLE IF NOT EXISTS` plus additive `ALTER TABLE`s, never a
-  rebuild.
+  users) and `files/`. Schema changes are additive (`CREATE TABLE IF NOT
+  EXISTS` plus `ALTER TABLE ADD COLUMN`s, never a rebuild) and bump
+  `SCHEMA_VERSION`: a board made by an older version then refuses to start
+  until a person runs `--upgrade`, which backs it up first.
 - **Backups must stay restorable.** Before a change that alters the
   tables, make sure `import_archive()` still loads older backups (it
   matches columns by name; add conversion code for anything renamed or

@@ -38,11 +38,25 @@ migrations. `service add` won't replace a service that's already there
 unless you say `--force`. To move a board somewhere new, export it and
 import it there (see **Moving to a new instance**).
 
+**Upgrading a board made by an older version.** When a new version changes
+the tables, it won't open an older board: it stops and says to run the
+upgrade, which you do once, yourself:
+
+```bash
+hearthboard --upgrade        # (--data DIR for another folder) backs the board up first, then upgrades it
+```
+
+It backs the board up into its own folder first (`before-upgrade-….tar.gz`),
+then upgrades it and prints what it did. A second run says it's already up to
+date. For 0.2.0 (projects): every ticket and wiki page goes in the project
+`general`, every human becomes a global admin (so nothing they could do stops
+working), agents become members of `general` and guests its viewers.
+
 ## Moving to a new instance
 
 One file carries the whole board: tickets, comments, files, history,
-chats, the wiki, settings and users. Users keep their tokens, so people and
-agents stay signed in.
+chats, the wiki, settings, users and projects (with their members and roles).
+Users keep their tokens, so people and agents stay signed in.
 
 ```bash
 hearthboard --export board.tar.gz                  # on the old one (or Settings → Export everything)
@@ -52,7 +66,60 @@ hearthboard service add                             # then run it
 
 The import goes into an empty board (`--replace` to overwrite tickets that are
 already there). Ids are kept, so links and ticket names still work. Exports from
-agent-tickets (this project's earlier name) import the same way.
+agent-tickets (this project's earlier name) import the same way. An export from
+before projects goes into `general`, as `--upgrade` does it.
+
+## Projects
+
+One project per team. Every board has `general`; a ticket filed without a
+project goes there. Accounts are board-wide, memberships per project, and a
+user can belong to any number of projects with a different role in each:
+
+| Role | In that project |
+| --- | --- |
+| admin | everything a member can, plus adding and removing its members (existing accounts) and renaming it |
+| member | read, create and work tickets, comment, upload; humans also accept and decline proposals and move tickets |
+| viewer | read only |
+
+**Global admins** (a flag on a human's account) are admins of every project,
+create and archive projects, and do all the account work: adding users,
+tokens, disabling, making other global admins. There's always at least one
+active global admin; the first human on a new board becomes one. Agents are
+members or viewers, never admins; guests are viewers. New users join
+`general`.
+
+- **Everyone sees only their projects.** Tickets, files, proposals, epic pages,
+  search, the wiki and team chats in other projects don't exist for them
+  (404). `/` goes to your project, or a picker if you have several; the top
+  bar switches between them. `/p/SLUG` is a project's board, with its own
+  backlog, done list, overview (`/p/SLUG/dashboard`) and members page.
+  `/all` lists every project you run in one list (global admins: all of
+  them).
+- **Agents work only their projects.** `POST /api/next` and `GET /api/wait`
+  cover the projects an agent is a member of (never ones it only views), and
+  take `project` (`records`, or `records,legal`) to narrow them.
+- **Moving a ticket** (humans in its project, or a global admin): to any
+  project, even one you're not in; it lands in that project's backlog, and the
+  move is in its history with who did it.
+- **Epics and dependencies cross projects.** Anyone who can see one of an
+  epic's tickets sees the epic; its progress counts the tickets they can see,
+  plus how many others there are. A dependency on a ticket you can't see shows
+  as "a ticket in another project", with no title, and still blocks.
+- **Taking someone out of a project** unassigns their tickets there (with an
+  event). **Archived** projects stay readable and take no new tickets.
+- **Wiki pages** are board-wide or a project's ("Who sees it" on the page).
+  Any human who can see a page can edit it. **Chats** are open to everyone
+  (guests read) unless scoped to a project, set when it's started
+  (`"project"`) or later by that project's admins: then only its members see
+  it, and nobody from outside can be added.
+
+The API: `GET /api/projects` (yours, with your role), `POST /api/projects`
+and `POST /api/projects/SLUG/archive` (global admins), `PATCH
+/api/projects/SLUG` (name, description), `GET /api/projects/SLUG/members`,
+`PUT /api/projects/SLUG/members/NAME` `{"role": "admin" | "member" |
+"viewer" | null}`, `?project=` on `GET /api/tickets`, `"project"` on `POST
+/api/tickets` and `PATCH /api/tickets/ID` (a move), `PATCH /api/chat/ID`
+`{"project": ...}`.
 
 ## Statuses
 
@@ -267,11 +334,11 @@ so an edit applies to the next ticket any agent picks up.
 
 Every user has a username, a kind (**human**, **agent** or **guest**) and
 their own token, which is who they are: the username goes on their
-comments and changes. Humans can do everything, including adding users of
-any kind, issuing new tokens (the old one stops working at once) and
-disabling users (never the last active human). Agents can only work
-tickets, as above. **Guests** can read everything (tickets, chat, the
-wiki) and change nothing: the server refuses every change, and their
+comments and changes. Global admins (see **Projects**) add users of any
+kind, issue new tokens (the old one stops working at once) and disable
+users (never the last active human, or the last global admin). Agents can
+only work tickets, as above. **Guests** can read everything in their
+projects (tickets, chat, the wiki) and change nothing: the server refuses every change, and their
 pages hide the forms and buttons and say they're read-only. They can still
 set their own theme and TTS mode. Guests can't be assigned tickets or added
 to chats.
@@ -280,14 +347,15 @@ Only a hash of each token is stored (not in the database, not in backups),
 so a token is shown once, when it's made. Lost one? Issue a new one.
 
 ```bash
-hearthboard --add-user frank --kind human     # the first human: prints their token
+hearthboard --add-user frank --kind human     # the first human (a global admin): prints their token
+hearthboard --add-user dana --kind human --global-admin
 hearthboard --add-user agent-1                # an agent (the default kind)
 hearthboard --list-users
 hearthboard --new-token agent-1               # replace a token
 hearthboard --disable agent-1                 # and --enable
 ```
 
-After that, humans can do the same from the **Users** page. Agents send
+After that, global admins can do the same from the **Users** page. Agents send
 `Authorization: Bearer <token>`; humans paste theirs on the sign-in page,
 and a cookie keeps them signed in until they sign out.
 

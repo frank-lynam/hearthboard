@@ -1159,13 +1159,13 @@ class TicketsTest(unittest.TestCase):
     def test_nav_and_settings(self):
         home = self.call("GET", "/", role="human")[1].decode()
         nav = home[home.index("<nav"):home.index("</nav>")]
-        for link in ('href="/"', 'href="/chat"', 'href="/wiki"', 'href="/new"', 'href="/settings"'):
+        for link in ('href="/"', 'href="/chat"', 'href="/wiki"', 'href="/new', 'href="/settings"'):
             self.assertIn(link, nav)
         for gone in ('href="/users"', 'href="/guidance"', 'href="/backlog"', 'href="/done"', 'id="theme"'):
             self.assertNotIn(gone, nav)
         self.assertIn('id="navx"', home)  # collapses
-        self.assertIn('<a href="/backlog">Backlog (', home)
-        self.assertIn('<a href="/done">Done</a>', home)
+        self.assertIn('<a href="/p/general/backlog">Backlog (', home)   # home is your project's board
+        self.assertIn('<a href="/p/general/done">Done</a>', home)
         self.assertIn('class="on">Dashboard', self.call("GET", "/backlog", role="human")[1].decode())
         settings = self.call("GET", "/settings", role="human")[1].decode()
         for t in ("light", "dark", "sepia", "midnight", "forest", "synthwave", "contrast", "goth"):
@@ -1916,6 +1916,82 @@ class ProjectsTest(unittest.TestCase):
         self.assertEqual(self.j("PATCH", f"/api/tickets/{self.ticket('records')['id']}", {"project": "old-team"},
                                 "boss")[0], 409)
         self.assertEqual(self.j("POST", "/api/projects/general/archive", {}, "boss")[0], 409)
+
+    # --- pages
+    def test_views(self):
+        page = lambda path, who: self.j("GET", path, who=who)
+        # bob is in general and legal: the picker; the switcher lists only his projects
+        code, html = page("/", "bob")
+        self.assertEqual(code, 200)
+        self.assertIn('href="/p/legal"', html)
+        self.assertNotIn("/p/records", html)
+        code, html = page("/p/legal", "bob")
+        self.assertIn('<select class="psw"', html)
+        self.assertIn('value="/p/legal" selected', html)
+        self.assertNotIn("records", html.lower().split('<select class="psw"')[1].split("</select>")[0])
+        self.assertEqual(page("/p/records", "bob")[0], 404)
+        for view in ("/backlog", "/done", "/dashboard", "/members"):
+            self.assertEqual(page("/p/legal" + view, "bob")[0], 200, view)
+        # /all: for admins of something
+        self.assertEqual(page("/all", "bob")[0], 403)
+        self.assertEqual(page("/all", "alice")[0], 200)
+        self.assertEqual(page("/all", "boss")[0], 200)
+        # a member sees the members page without the controls; its admin gets them
+        self.assertNotIn("setRole(", page("/p/records/members", "rita")[1].split("<script>")[0])
+        self.assertIn("setRole(", page("/p/records/members", "alice")[1])
+        # the ticket page: its project, and a move control for the humans who work in it
+        t = self.ticket("records")
+        self.assertIn('href="/p/records"', page(f"/t/{t['id']}", "carl")[1])
+        self.assertNotIn('id="mvp"', page(f"/t/{t['id']}", "carl")[1])       # a viewer
+        self.assertIn('id="mvp"', page(f"/t/{t['id']}", "alice")[1])
+        # new tickets: the projects you can file into, the page's own first
+        html = page("/new?project=records", "alice")[1]
+        self.assertIn('<option value="records" selected>', html)
+        self.assertNotIn('value="legal"', html.split('id="nt-proj"')[1].split("</select>")[0])
+        # the Users page shows projects and global admins; the account buttons are the global admins'
+        self.assertIn("Global admin", page("/users", "boss")[1])
+        self.assertIn("records</a> (admin)", page("/users", "boss")[1])
+        self.assertNotIn("newToken(", page("/users", "alice")[1].split("<script>")[0])
+        # the briefing lists your projects; the skill explains them
+        self.assertIn("Your projects: `general` (member), `records` (member)", page("/api", "rita")[1])
+        self.assertIn("## Projects", page("/api/skill", "rita")[1])
+
+    def test_wiki_is_scoped(self):
+        self.assertEqual(self.j("POST", "/api/wiki", {"title": "Records team", "project": "records"}, "alice")[0], 201)
+        self.assertEqual(self.j("POST", "/api/wiki", {"title": "Filing", "parent": "records-team"}, "alice")[1]["project"],
+                         "records")                                        # under a project's page: that project
+        self.assertEqual(self.j("POST", "/api/wiki", {"title": "Everyone"}, "bob")[0], 201)
+        self.assertEqual(self.j("GET", "/api/wiki/records-team/filing", who="rita")[0], 200)
+        for path in ("/api/wiki/records-team", "/api/wiki/records-team/filing"):
+            self.assertEqual(self.j("GET", path, who="bob")[0], 404)
+        tree = json.dumps(self.j("GET", "/api/wiki", who="bob")[1])
+        self.assertIn("everyone", tree)
+        self.assertNotIn("records-team", tree)
+        self.assertNotIn("records-team", json.dumps(self.j("GET", "/api/wiki?q=filing", who="bob")[1]))
+        # any human who can see a page edits it, whatever its project
+        self.assertEqual(self.j("PATCH", "/api/wiki/everyone", {"body": "edited by alice"}, "alice")[0], 200)
+
+    def test_chat_is_scoped(self):
+        # unscoped: everyone reads, guests included (who can't post)
+        code, open_ = self.j("POST", "/api/chat", {"title": "Lobby", "body": "hello all"}, "boss")
+        self.assertEqual(self.j("GET", f"/api/chat/{open_['id']}", who="gus")[0], 200)
+        self.assertEqual(self.j("POST", f"/api/chat/{open_['id']}/messages", {"body": "hi"}, "gus")[0], 403)
+        # scoped to records: invisible to everyone else, unread counts included
+        code, team = self.j("POST", "/api/chat", {"title": "Records room", "members": ["rita"], "project": "records",
+                                                  "body": "records only"}, "alice")
+        self.assertEqual(code, 201, team)
+        self.assertEqual(self.j("GET", f"/api/chat/{team['id']}", who="rita")[0], 200)
+        for who in ("bob", "lena", "gus"):
+            self.assertEqual(self.j("GET", f"/api/chat/{team['id']}", who=who)[0], 404)
+            self.assertNotIn("Records room", json.dumps(self.j("GET", "/api/chat", who=who)[1]))
+        self.assertEqual(self.j("POST", f"/api/chat/{team['id']}/members", {"username": "lena"}, "alice")[0], 409)
+        self.assertEqual(self.j("POST", "/api/chat", {"title": "x", "members": ["lena"], "project": "records"}, "alice")[0], 400)
+        # scoping a chat that has outsiders in it is refused until they're out
+        code, mixed = self.j("POST", "/api/chat", {"title": "Mixed", "members": ["alice", "bob"], "body": "hi"}, "boss")
+        self.assertEqual(self.j("PATCH", f"/api/chat/{mixed['id']}", {"project": "records"}, "alice")[0], 409)
+        self.assertEqual(self.j("PATCH", f"/api/chat/{mixed['id']}", {"project": "records"}, "rita")[0], 403)
+        # and the page says who it's for
+        self.assertIn("members can see and post here", self.j("GET", f"/chat/{team['id']}", who="alice")[1])
 
     # --- upgrading a board made by 0.1.2, and importing its export (fixtures made with that version)
     def test_upgrade_from_0_1_2(self):

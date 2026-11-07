@@ -9,9 +9,10 @@ and an SQLite database.
   hearthboard service add         # run it as a systemd user service, with a nightly backup
   hearthboard --export backups/   # back everything up (see "Backups")
   hearthboard --import FILE       # restore a backup into an empty data folder
+  hearthboard --upgrade           # bring a board made by an older version up to date (backs it up first)
 
 Data lives in $HEARTHBOARD_DATA, else ~/.local/share/hearthboard. To move to a new
-instance: --export here, --import there (everything: tickets, chats, wiki, users).
+instance: --export here, --import there (everything: tickets, chats, wiki, users, projects).
 
 Tickets move through five statuses:
   backlog      an idea, not cleared for work yet
@@ -20,9 +21,10 @@ Tickets move through five statuses:
   review       the agent is done or needs a decision: the human's turn
   done         approved by the human
 
-Users have a name, a kind (human or agent) and their own token, which is
-who they are. Humans can do anything, including adding users and issuing
-or revoking tokens (the Users page). Agents use the JSON API and can only
+Every board has projects, one per team (general always); each user sees and works only the projects
+they're a member of (admin, member or viewer), and global admins run them all. Users have a name, a
+kind (human, agent or guest) and their own token, which is who they are. Global admins add users and
+issue or revoke tokens (the Users page). Agents use the JSON API and can only
 move tickets between ready, in_progress and review, and can't change
 backlog or done tickets (comments are always allowed). Only a hash of each
 token is stored. API docs: GET /api.
@@ -276,7 +278,7 @@ CREATE INDEX IF NOT EXISTS events_ticket ON events(ticket_id, at);
 """
 
 
-__version__ = "0.1.2"
+__version__ = "0.2.0"
 
 # Bumped whenever the tables change. A board made by an older version won't open until a person runs
 # `hearthboard --upgrade` (it backs up first); hearthboard never changes an install on its own.
@@ -471,6 +473,18 @@ class Store:
         if projects is not None:
             ids = set(projects) if ids is None else ids & set(projects)
         return self._in(f"{alias}.project_id", ids)
+
+    def _sees_for(self, username):
+        """Ids of the projects `username` can see (any role), or None for all (a global admin)."""
+        row = self.db().execute("SELECT global_admin, kind FROM users WHERE username = ?", (username,)).fetchone()
+        if row and row["global_admin"] and row["kind"] == "human":
+            return None
+        return {r[0] for r in self.db().execute("SELECT project_id FROM project_members WHERE username = ?", (username,))}
+
+    def _chat_sql(self, alias, username):
+        """SQL for the chats `username` can see: unscoped ones, and those scoped to one of their projects."""
+        cond, args = self._in(f"{alias}.project_id", self._sees_for(username))
+        return f"({alias}.project_id IS NULL OR {cond})", args
 
     def _check_worker(self, pid, what="change things"):
         """Members and admins of a project work in it; viewers only read."""
@@ -1440,6 +1454,16 @@ class Store:
             raise ApiError(404, "no such wiki page")
         return dict(row)
 
+    def _wiki_sees(self, row):
+        """Board-wide pages (no project) are everyone's; a project's pages are its members'."""
+        return row["project_id"] is None or self.can_see(row["project_id"])
+
+    def _wiki_project(self, slug, default=None):
+        """The project id a page goes in: a slug this request can see, "" for board-wide, or `default`."""
+        if slug is None:
+            return default
+        return self.project(slug)["id"] if str(slug).strip() else None
+
     def wiki_resolve(self, path):
         """The page at "section/page/subpage"."""
         parts = [p for p in str(path or "").strip("/").lower().split("/") if p]
@@ -1449,7 +1473,7 @@ class Store:
         for part in parts:
             row = self.db().execute("SELECT * FROM wiki_pages WHERE COALESCE(parent_id, 0) = ? AND slug = ?",
                                     (parent or 0, part)).fetchone()
-            if not row:
+            if not row or not self._wiki_sees(row):          # a page you can't see hides the ones under it
                 raise ApiError(404, f"no wiki page {'/'.join(parts)}")
             parent = row["id"]
         return dict(row)
@@ -1473,18 +1497,20 @@ class Store:
     def wiki_children(self, pid):
         rows = self.db().execute("SELECT * FROM wiki_pages WHERE COALESCE(parent_id, 0) = ? ORDER BY title COLLATE NOCASE",
                                  (pid or 0,)).fetchall()
-        return [dict(r) for r in rows]
+        return [dict(r) for r in rows if self._wiki_sees(r)]
 
     def wiki_page(self, path):
         p = self.wiki_resolve(path)
         p["path"] = self.wiki_path(p)
+        p["project"] = self.project_by_id(p["project_id"])["slug"] if p["project_id"] else None
         p["breadcrumbs"] = [{"title": t, "path": x} for t, x in self.wiki_crumbs(p)]
         p["children"] = [{"title": c["title"], "path": f'{p["path"]}/{c["slug"]}'} for c in self.wiki_children(p["id"])]
         return p
 
     def wiki_tree(self):
         """Every page, as nested {"title", "path", "children"}."""
-        rows = [dict(r) for r in self.db().execute("SELECT id, parent_id, slug, title FROM wiki_pages")]
+        rows = [dict(r) for r in self.db().execute("SELECT id, parent_id, slug, title, project_id FROM wiki_pages")
+                if self._wiki_sees(r)]
         kids = {}
         for r in rows:
             kids.setdefault(r["parent_id"], []).append(r)
@@ -1503,7 +1529,16 @@ class Store:
         words = [w for w in re.split(r"\W+", q.lower()) if w]
         if not words:
             return []
-        rows = [dict(r) for r in self.db().execute("SELECT id, parent_id, slug, title, body, updated_at FROM wiki_pages")]
+        every = {r["id"]: dict(r) for r in self.db().execute(
+            "SELECT id, parent_id, slug, title, body, updated_at, project_id FROM wiki_pages")}
+
+        def visible(r):                       # it and every page above it
+            while r:
+                if not self._wiki_sees(r):
+                    return False
+                r = every.get(r["parent_id"])
+            return True
+        rows = [r for r in every.values() if visible(r)]
         by_id = {r["id"]: r for r in rows}
 
         def place(r):  # this page's and its ancestors' titles and slugs
@@ -1552,14 +1587,17 @@ class Store:
         parent = self.wiki_resolve(data["parent"]) if data.get("parent") else None
         slug = self._wiki_slug(data.get("slug"), title)
         body = str(data.get("body") or "")
+        # A project's page (its members see it), or board-wide; under a project's page, that project by default.
+        proj = self._wiki_project(data.get("project"), parent["project_id"] if parent else None)
         now = time.time()
         with self.write_lock:
             db = self.db()
             try:
                 with db:
                     pid = db.execute("INSERT INTO wiki_pages (parent_id, slug, title, body, created_by, created_at, "
-                                     "updated_by, updated_at) VALUES (?,?,?,?,?,?,?,?)",
-                                     (parent["id"] if parent else None, slug, title, body, actor, now, actor, now)).lastrowid
+                                     "updated_by, updated_at, project_id) VALUES (?,?,?,?,?,?,?,?,?)",
+                                     (parent["id"] if parent else None, slug, title, body, actor, now, actor, now,
+                                      proj)).lastrowid
                     self._wiki_save(db, pid, title, body, actor, now)
             except sqlite3.IntegrityError:
                 raise ApiError(409, f"there's already a page called {slug} there")
@@ -1574,6 +1612,7 @@ class Store:
             raise ApiError(400, "a page needs a title")
         body = str(data["body"]) if "body" in data else p["body"]
         slug = self._wiki_slug(data["slug"], title) if data.get("slug") else p["slug"]
+        proj = self._wiki_project(data.get("project"), p["project_id"])
         parent_id = p["parent_id"]
         if "parent" in data:
             parent_id = self.wiki_resolve(data["parent"])["id"] if data["parent"] else None
@@ -1588,7 +1627,8 @@ class Store:
             try:
                 with db:
                     db.execute("UPDATE wiki_pages SET parent_id = ?, slug = ?, title = ?, body = ?, updated_by = ?, "
-                               "updated_at = ? WHERE id = ?", (parent_id, slug, title, body, actor, now, p["id"]))
+                               "updated_at = ?, project_id = ? WHERE id = ?",
+                               (parent_id, slug, title, body, actor, now, proj, p["id"]))
                     if (title, body) != (p["title"], p["body"]):
                         self._wiki_save(db, p["id"], title, body, actor, now)
             except sqlite3.IntegrityError:
@@ -1598,7 +1638,7 @@ class Store:
     def wiki_delete(self, path, actor, role):
         self._wiki_human(role)
         p = self.wiki_resolve(path)
-        if self.wiki_children(p["id"]):
+        if self.db().execute("SELECT 1 FROM wiki_pages WHERE parent_id = ?", (p["id"],)).fetchone():   # seen or not
             raise ApiError(409, "move or delete the pages under it first")
         with self.write_lock:
             db = self.db()
@@ -1772,9 +1812,10 @@ class Store:
         except (TypeError, ValueError):
             raise ApiError(404, "no such conversation")
         row = self.db().execute("SELECT * FROM conversations WHERE id = ?", (cid,)).fetchone()
-        if not row:
-            raise ApiError(404, f"no conversation {cid}")
+        if not row or (row["project_id"] is not None and not self.can_see(row["project_id"])):
+            raise ApiError(404, f"no conversation {cid}")       # a team's chat, outside the team: not there
         c = dict(row)
+        c["project"] = self.project_by_id(c["project_id"])["slug"] if c["project_id"] else None
         c["members"] = [r[0] for r in self.db().execute(
             "SELECT username FROM chat_members WHERE conversation_id = ? ORDER BY username COLLATE NOCASE", (cid,))]
         others = [m for m in c["members"] if not viewer or m.lower() != viewer.lower()]
@@ -1791,14 +1832,21 @@ class Store:
             (user, cid, user)).fetchone()[0]
 
     def unread_total(self, user):
+        see, args = self._chat_sql("c", user)
         return self.db().execute(
             "SELECT COUNT(*) FROM messages g JOIN chat_members m ON m.conversation_id = g.conversation_id "
-            "AND m.username = ? WHERE g.id > m.last_read AND g.author != ? COLLATE NOCASE", (user, user)).fetchone()[0]
+            f"AND m.username = ? JOIN conversations c ON c.id = g.conversation_id WHERE {see} AND g.id > m.last_read "
+            "AND g.author != ? COLLATE NOCASE", [user] + args + [user]).fetchone()[0]
 
     def conversations(self, viewer, limit=200):
         out = []
-        for r in self.db().execute("SELECT id FROM conversations ORDER BY updated_at DESC LIMIT ?", (limit,)).fetchall():
-            c = self.conversation(r[0], viewer)
+        see, args = self._chat_sql("c", viewer) if viewer else ("1", [])
+        for r in self.db().execute(f"SELECT id FROM conversations c WHERE {see} ORDER BY updated_at DESC LIMIT ?",
+                                   args + [limit]).fetchall():
+            try:
+                c = self.conversation(r[0], viewer)
+            except ApiError:                 # scoped to a project this request can't see
+                continue
             last = self.db().execute("SELECT author, role, body, created_at FROM messages WHERE conversation_id = ? "
                                      "ORDER BY id DESC LIMIT 1", (r[0],)).fetchone()
             c["last_message"] = dict(last) if last else None
@@ -1860,9 +1908,11 @@ class Store:
     def unread(self, user):
         """The conversations `user` has unread messages in, each with those messages."""
         out = []
+        see, args = self._chat_sql("c", user)
         for r in self.db().execute(
                 "SELECT m.conversation_id, m.last_read FROM chat_members m JOIN conversations c "
-                "ON c.id = m.conversation_id WHERE m.username = ? ORDER BY c.updated_at DESC", (user,)).fetchall():
+                f"ON c.id = m.conversation_id WHERE m.username = ? AND {see} ORDER BY c.updated_at DESC",
+                [user] + args).fetchall():
             msgs = [x for x in self.messages(r[0], after=r[1]) if x["author"].lower() != user.lower()]
             if msgs:
                 c = self.conversation(r[0], user)
@@ -1876,9 +1926,10 @@ class Store:
         (from agents, or notes like "(added ...)": reading them is enough, so two agents can't owe each
         other replies forever). Each has "messages" and "needs_reply"."""
         db, out = self.db(), []
+        see, args = self._chat_sql("c", user)
         for cid, last_read in db.execute(
                 "SELECT m.conversation_id, m.last_read FROM chat_members m JOIN conversations c ON c.id = m.conversation_id "
-                "WHERE m.username = ? ORDER BY c.updated_at DESC", (user,)).fetchall():
+                f"WHERE m.username = ? AND {see} ORDER BY c.updated_at DESC", [user] + args).fetchall():
             mine = db.execute("SELECT COALESCE(MAX(id), 0) FROM messages WHERE conversation_id = ? AND author = ? "
                               "COLLATE NOCASE", (cid, user)).fetchone()[0]
             owed = lambda m: m["role"] == "human" and m["id"] > mine
@@ -1929,12 +1980,17 @@ class Store:
         members.add(actor)
         if len(members) < 2 and not title:
             raise ApiError(400, "say who it's with (members), or give it a title")
+        pid = self.project(data["project"])["id"] if data.get("project") else None   # a team's chat
+        if pid is not None:
+            out = [m for m in members if not self._in_project(m, pid)]
+            if out:
+                raise ApiError(400, f"{', '.join(sorted(out))} isn't in that project: a project's chat is for its members")
         cid = None
         with self.write_lock:
             db = self.db()
-            if not title and len(members) == 2:
+            if not title and len(members) == 2 and pid is None:
                 want = {m.lower() for m in members}
-                for r in db.execute("SELECT id FROM conversations WHERE title IS NULL").fetchall():
+                for r in db.execute("SELECT id FROM conversations WHERE title IS NULL AND project_id IS NULL").fetchall():
                     have = {x[0].lower() for x in db.execute(
                         "SELECT username FROM chat_members WHERE conversation_id = ?", (r[0],))}
                     if have == want:
@@ -1943,8 +1999,8 @@ class Store:
             if cid is None:
                 now = time.time()
                 with db:
-                    cid = db.execute("INSERT INTO conversations (title, created_by, created_at, updated_at) "
-                                     "VALUES (?,?,?,?)", (title, actor, now, now)).lastrowid
+                    cid = db.execute("INSERT INTO conversations (title, created_by, created_at, updated_at, project_id) "
+                                     "VALUES (?,?,?,?,?)", (title, actor, now, now, pid)).lastrowid
                     for m in members:
                         db.execute("INSERT INTO chat_members (conversation_id, username) VALUES (?, ?)", (cid, m))
         body = str(data.get("body") or "").strip()
@@ -1988,11 +2044,40 @@ class Store:
             (self.files / p).unlink(missing_ok=True)
         return {"deleted": c["id"], "name": c["name"]}
 
+    def _in_project(self, username, pid):
+        """Any role in the project, or a global admin."""
+        ids = self._sees_for(username)
+        return ids is None or pid in ids
+
+    def set_chat_project(self, cid, slug, actor):
+        """Scope a chat to a project (only its members then see it), or unscope it (slug None: everyone's again).
+        A global admin, or the admin of that project (to scope it) or of its current one (to unscope it).
+        Refused while anyone in the chat is outside the project."""
+        c = self.conversation(cid)
+        if slug:
+            p = self.project(slug)
+            if self.role_in(p["id"]) != "admin":
+                raise ApiError(403, f"only {p['slug']}'s admins (or a global admin) can make a chat its own")
+            out = [m for m in c["members"] if not self._in_project(m, p["id"])]
+            if out:
+                raise ApiError(409, f"{', '.join(out)} {'is' if len(out) == 1 else 'are'} in this chat but not in "
+                                    f"{p['slug']}: take them out first")
+            pid = p["id"]
+        else:
+            if c["project_id"] is not None and self.role_in(c["project_id"]) != "admin":
+                raise ApiError(403, "only that project's admins (or a global admin) can open this chat to everyone")
+            pid = None
+        with self.write_lock, self.db() as db:
+            db.execute("UPDATE conversations SET project_id = ? WHERE id = ?", (pid, c["id"]))
+        return self.conversation(c["id"], actor)
+
     def add_member(self, cid, username, actor, role):
         c = self.conversation(cid)
         u = self.user(username)
         if u["kind"] == "guest":
             raise ApiError(400, "guests can read chats but can't be in them")
+        if c["project_id"] is not None and not self._in_project(u["username"], c["project_id"]):
+            raise ApiError(409, f"{u['username']} isn't in {c['project']}: this chat is for that project's members")
         with self.write_lock:
             db = self.db()
             with db:
@@ -2647,14 +2732,17 @@ def linkify(text):
 CHAT_BADGE = "<!--chat-badge-->"
 
 
-def page(title, body, active="", review_count=0):
-    tabs = [("/", "Dashboard"), ("/chat", "Chat"), ("/wiki", "Wiki"), ("/new", "+ New"), ("/settings", "Settings")]
+def page(title, body, active="", review_count=0, project=None):
+    """A whole page. `project`: the project it's about (the top bar's switcher shows it; Handler.html fills it in)."""
+    tabs = [("/", "Dashboard"), ("/chat", "Chat"), ("/wiki", "Wiki"),
+            ("/new" + (f"?project={project}" if project else ""), "+ New"), ("/settings", "Settings")]
     # Pages reached from the dashboard or settings light up those tabs.
     active = {"/backlog": "/", "/done": "/", "/users": "/settings", "/guidance": "/settings"}.get(active, active)
     # The chat badge is per viewer: Handler.html() fills in CHAT_BADGE.
-    nav = "".join(f'<a href="{h}" class="{"on" if h == active else ""}">{esc(n)}'
+    nav = "".join(f'<a href="{h}" class="{"on" if h.split("?")[0] == active else ""}">{esc(n)}'
                   f'{f"<span class=n>{review_count}</span>" if h == "/" and review_count else ""}'
                   f'{CHAT_BADGE if h == "/chat" else ""}</a>' for h, n in tabs)
+    nav += f"<!--projects:{project or ''}-->"
     return (f'<!doctype html><html lang="en"><head><meta charset="utf-8">'
             f'<meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(title)} · Hearthboard</title>'
             f'<style>{CSS}</style><script>{JS}</script></head><body>'
@@ -2711,11 +2799,14 @@ setInterval(async () => {
 """
 
 
-def render_dashboard(store):
-    proposals = len(store.tickets(["backlog"], proposed=True))
-    by = {s: store.tickets([s], kind="ticket", proposed=False) for s in ("review", "in_progress", "ready")}
+def render_dashboard(store, proj=None):
+    """The board: a project's (`proj`), or every project the viewer can see."""
+    only = {proj["id"]} if proj else None
+    base = f"/p/{proj['slug']}" if proj else ""
+    proposals = len(store.tickets(["backlog"], proposed=True, projects=only))
+    by = {s: store.tickets([s], kind="ticket", proposed=False, projects=only) for s in ("review", "in_progress", "ready")}
     # Open epics, active ones first.
-    epics = sorted(store.tickets(["backlog", "in_progress"], kind="epic", proposed=False),
+    epics = sorted(store.tickets(["backlog", "in_progress"], kind="epic", proposed=False, projects=only),
                    key=lambda e: e["status"] != "in_progress")
     rows = []
     for e in epics:
@@ -2726,19 +2817,23 @@ def render_dashboard(store):
                     f'<span class="t">{esc(e["title"])}</span><span class="chip s-{e["status"]}">{EPIC_STATES[e["status"]]}</span>'
                     f'</div><div class="meta">{pr["done"]} of {pr["total"]} done'
                     f'{f" · {doing} in progress" if doing else ""}</div><div class="bar"><i style="width:{pct}%"></i></div></a>')
-    backlog = len(store.tickets(["backlog"], proposed=False))
-    body = ('<div id="dash"><h1>In flight</h1>'
-            f'<p class="dlinks"><a href="/backlog">Backlog ({backlog})</a><a href="/done">Done</a>'
-            + (f'<a href="/backlog">Proposals ({proposals})</a>' if proposals else "") + '</p><div class="cols">'
+    backlog = len(store.tickets(["backlog"], proposed=False, projects=only))
+    head = (f'<h1>In flight <span class="meta">· {esc(proj["name"])}</span>'
+            f'{" <span class=chip>Archived</span>" if proj["archived"] else ""}</h1>' if proj else '<h1>In flight</h1>')
+    body = (f'<div id="dash">{head}'
+            f'<p class="dlinks"><a href="{base}/backlog">Backlog ({backlog})</a><a href="{base}/done">Done</a>'
+            + (f'<a href="{base}/backlog">Proposals ({proposals})</a>' if proposals else "")
+            + (f'<a href="{base}/dashboard">Overview</a><a href="{base}/members">Members</a>' if proj else "")
+            + '</p><div class="cols">'
             + column("Needs your review", by["review"], "Nothing waiting on you.")
             + column("In progress", by["in_progress"], "No agent is working on anything.")
             + column("Ready to work", by["ready"], "Nothing cleared for agents. Promote something from the backlog.")
             + '</div>'
             + (f'<p class="banner prop">Agents proposed {proposals} ticket{"s" if proposals != 1 else ""}: '
-               f'<a href="/backlog">review them in the backlog</a>.</p>' if proposals else "")
+               f'<a href="{base}/backlog">review them in the backlog</a>.</p>' if proposals else "")
             + f'<h2>Epics ({len(epics)})</h2>' + ("".join(rows) or '<p class="empty">No open epics.</p>')
             + f'</div><script>{DASH_JS}</script>')
-    return page("Dashboard", body, "/", len(by["review"]))
+    return page(proj["name"] if proj else "Dashboard", body, "/", len(by["review"]), proj["slug"] if proj else None)
 
 
 PROPOSAL_JS = """
@@ -2774,12 +2869,13 @@ def proposal_row(store, t, children=()):
     return head
 
 
-def render_list(store, status, q):
+def render_list(store, status, q, proj=None):
+    only = {proj["id"]} if proj else None
     items = store.tickets([status], q=q or None, recent_first=status == "done",
-                          proposed=False if status == "backlog" else None)
+                          proposed=False if status == "backlog" else None, projects=only)
     props = ""
     if status == "backlog" and not q:
-        proposed = store.tickets(["backlog"], proposed=True)
+        proposed = store.tickets(["backlog"], proposed=True, projects=only)
         ids = {t["id"] for t in proposed}
         epics = [t for t in proposed if t["kind"] == "epic"]
         loose = [t for t in proposed if t["kind"] != "epic" and t.get("epic_id") not in ids]
@@ -2803,18 +2899,20 @@ def render_list(store, status, q):
             pr = '<span class="tag">Cancelled</span> ' + pr
         if t.get("blocked_by"):
             pr += f'<span class="tag blocked">after {", ".join(t["blocked_by"])}</span> '
+        where = "" if proj else f'<span class="tag">{esc(t["project"] or "")}</span> '
         rows.append(f'<div class="item{" prop" if btn else ""}"><a href="/t/{t["id"]}"><span class="id">{t["id"]}</span> '
-                    f'<b>{esc(t["title"])}</b><div class="meta">{pr}{"created" if status == "backlog" else "finished"} '
+                    f'<b>{esc(t["title"])}</b><div class="meta">{where}{pr}{"created" if status == "backlog" else "finished"} '
                     f'{ago(t["created_at"] if status == "backlog" else t["updated_at"])}</div></a>{btn}</div>')
-    title = "Backlog" if status == "backlog" else "Done"
+    title = ("Backlog" if status == "backlog" else "Done") + (f": {proj['name']}" if proj else "")
     search = (f'<form class="row" method="get" style="margin-bottom:12px"><input type="search" name="q" value="{esc(q)}" '
               f'placeholder="Search {title.lower()}" aria-label="Search"><button>Search</button></form>')
     hint = ('<p class="meta">Ideas waiting to be cleared. "Make ready" lets agents pick one up.</p>' if status == "backlog"
-            else '<p class="meta">Tickets closed as done (and any cancelled or declined). <a href="/api/export">Export everything</a> '
-                 '(tickets, comments, chat, wiki, history, files and users).</p>')
-    body = (f'<h1>{title}</h1>{hint}{search}{props}<div class="list">{"".join(rows) or "<p class=empty>Nothing here.</p>"}</div>'
+            else '<p class="meta">Tickets closed as done (and any cancelled or declined).'
+                 + (' <a href="/api/export">Export everything</a> (tickets, comments, chat, wiki, history, files and '
+                    'users, every project).' if store.is_global_admin() else "") + '</p>')
+    body = (f'<h1>{esc(title)}</h1>{hint}{search}{props}<div class="list">{"".join(rows) or "<p class=empty>Nothing here.</p>"}</div>'
             + (f'<script>{PROPOSAL_JS}</script>' if status == "backlog" and not props else ""))
-    return page(title, body, "/" + status, len(store.tickets(["review"])))
+    return page(title, body, "/" + status, len(store.tickets(["review"])), proj["slug"] if proj else None)
 
 
 def prio_select(tid, current=2, label="Priority"):
@@ -2973,7 +3071,8 @@ function setKind(kind){
 $('nf').onsubmit = async (e) => {
   e.preventDefault();
   const epic = $('nf').dataset.kind === 'epic';
-  const data = {title: $('nt-title').value, description: $('nt-desc').value, kind: epic ? 'epic' : 'ticket'};
+  const data = {title: $('nt-title').value, description: $('nt-desc').value, kind: epic ? 'epic' : 'ticket',
+                project: $('nt-proj').value};
   if (!epic) Object.assign(data, {status: $('nt-status').value, priority: +$('nt-prio').value,
     assignee: $('nt-who').value || null, epic_id: $('nt-epic').value || null, depends_on: $('nt-deps').value});
   try { const t = await api('POST', '/api/tickets', data); location = '/t/' + t.id; } catch (err) { fail(err); }
@@ -2985,10 +3084,15 @@ function clearEpic(){ $('nt-epic').value = ''; $('nt-epic-pick').value = ''; $('
 """
 
 
-def render_new(store, epic=None, prefill=("", ""), after=None):
+def render_new(store, epic=None, prefill=("", ""), after=None, project=None):
     """The new-ticket page. `after`: a ticket this one follows on from (it must be done first, and the new
-    one goes in its epic)."""
+    one goes in its epic). `project`: the one it goes in to start with (the page's own, usually)."""
     opts = "".join(f'<option value="{s}"{" selected" if s == "backlog" else ""}>{LABELS[s]}</option>' for s in STATUSES)
+    can = [p for p in store.projects(include_archived=False) if p["role"] in ("admin", "member")]
+    project = project if project in {p["slug"] for p in can} else GENERAL if GENERAL in {p["slug"] for p in can} \
+        else (can[0]["slug"] if can else "")
+    popts = "".join(f'<option value="{p["slug"]}"{" selected" if p["slug"] == project else ""}>{esc(p["name"])}</option>'
+                    for p in can)
     follows = (f'<p class="meta" style="margin:-8px 0 12px">Follows on from <a href="/t/{after["id"]}">'
                f'<span class="id">{after["id"]}</span> {esc(after["title"])}</a>: it\'s filled in under '
                f'"Must be done first"{" and the epic" if epic else ""}.</p>' if after else "")
@@ -2999,6 +3103,7 @@ def render_new(store, epic=None, prefill=("", ""), after=None):
  <button type="button" data-kind="epic" aria-pressed="false" onclick="setKind('epic')"><b>Epic</b>
   <span class="meta">A plan that groups tickets; its state follows them</span></button>
 </div>
+<label>Project <select id="nt-proj">{popts}</select></label>
 <label>Title<input type="text" id="nt-title" required value="{esc(prefill[0])}"></label>
 <label>Description<textarea id="nt-desc" rows="8">{esc(prefill[1])}</textarea></label>
 <p class="meta" style="margin:-4px 0 0">Link wiki pages with <code>[[section/page]]</code>: every wiki page has a Copy link button.</p>
@@ -3012,10 +3117,11 @@ def render_new(store, epic=None, prefill=("", ""), after=None):
 <input type="text" id="nt-deps" placeholder="amber-otter, quiet-falcon" value="{esc(after["id"] + ", ") if after else ""}"></label>
 <div><button class="primary" id="nt-go">Create ticket</button></div></form>
 <script>{dep_candidates(store)}{epic_candidates(store)}{DEP_PICKER_JS}{EPIC_PICKER_JS}{NEW_JS}</script>"""
-    return page("New ticket", body, "/new", len(store.tickets(["review"])))
+    return page("New ticket", body, "/new", len(store.tickets(["review"])), project)
 
 
 def render_users(store, me):
+    ga = store.is_global_admin()
     rows = []
     for u in store.users():
         state = '<span class="chip s-backlog">Disabled</span>' if u["disabled"] else ""
@@ -3023,16 +3129,25 @@ def render_users(store, me):
         seen = ago(u["last_seen"]) if u["last_seen"] else "never"
         toggle = "Enable" if u["disabled"] else "Disable"
         name = json.dumps(u["username"])
+        badge = ' <span class="chip s-review">Global admin</span>' if u["global_admin"] else ""
+        projs = ", ".join(f'<a href="/p/{slug}">{esc(slug)}</a> ({role})' for slug, role in u["projects"].items())
+        acts = ((f"<button onclick='newToken({esc(name)}, {esc(json.dumps(u['kind']))})'>New token</button>"
+                 f"<button onclick='toggleUser({esc(name)}, {str(not u['disabled']).lower()})'>{toggle}</button>"
+                 + (f"<button onclick='setGlobal({esc(name)}, {str(not u['global_admin']).lower()})'>"
+                    f"{'Not global admin' if u['global_admin'] else 'Make global admin'}</button>"
+                    if u["kind"] == "human" else "")) if ga else "")
         rows.append(f'<div class="item"><div style="min-width:0;flex:1"><b>{esc(u["username"])}</b>{you} '
-                    f'<span class="chip {"s-in_progress" if u["kind"] == "human" else "s-ready"}">{u["kind"]}</span> {state}'
+                    f'<span class="chip {"s-in_progress" if u["kind"] == "human" else "s-ready"}">{u["kind"]}</span>{badge} {state}'
                     f'<div class="meta">added {when(u["created_at"])}{" by " + esc(u["created_by"]) if u["created_by"] else ""}'
-                    f' · last seen {seen}</div></div><div class="row">'
-                    f"<button onclick='newToken({esc(name)}, {esc(json.dumps(u['kind']))})'>New token</button>"
-                    f"<button onclick='toggleUser({esc(name)}, {str(not u['disabled']).lower()})'>{toggle}</button></div></div>")
+                    f' · last seen {seen}</div><div class="meta">projects: {projs or "none"}</div></div>'
+                    f'<div class="row">{acts}</div></div>')
     body = f"""<h1>Users</h1>
-<p class="meta">Humans can do anything, including managing users. Agents use the API: they can move tickets between
-Ready, In progress and Needs review, and comment. Each user has their own token; only a hash of it is stored, so a
-token is shown once, when it's made. Give agents theirs as <code>Authorization: Bearer &lt;token&gt;</code>.</p>
+<p class="meta">Accounts are board-wide; what each one can see and do depends on its projects. <b>Global admins</b>
+run every project and do the account work (adding users, tokens, disabling, global admins). A project's
+<b>admins</b> manage its members on its Members page. Agents use the API: they can move tickets between Ready, In
+progress and Needs review, and comment. Each user has their own token; only a hash of it is stored, so a token is
+shown once, when it's made. Give agents theirs as <code>Authorization: Bearer &lt;token&gt;</code>. New users join
+<a href="/p/{GENERAL}">general</a>.</p>
 <div id="tok" class="box" hidden style="margin-bottom:14px;border-color:var(--ready)"><b id="tokwho"></b>
 <p class="meta">Copy it now: it won't be shown again.</p><div class="row"><input type="text" id="tokval" readonly>
 <button class="primary" onclick="copyTok('tokval')">Copy</button></div>
@@ -3041,9 +3156,10 @@ the machine it'll work on. For a hobkin you already have, change <code>--id</cod
 machine with no model set up yet, put <code>API_URL MODEL KEY</code> in front:</p>
 <div class="row"><input type="text" id="hobkincmd" readonly><button onclick="copyTok('hobkincmd')">Copy</button></div></div></div>
 <div class="list">{"".join(rows)}</div>
-<h2>Add a user</h2><form class="row box" id="uf"><input type="text" id="uname" placeholder="name, e.g. agent-1"
+{'' if not ga else """<h2>Add a user</h2><form class="row box" id="uf"><input type="text" id="uname" placeholder="name, e.g. agent-1"
  aria-label="Username" style="flex:1;min-width:160px" required><select id="ukind" style="width:auto" aria-label="Kind">
- <option value="agent">Agent</option><option value="human">Human</option><option value="guest">Guest (read-only)</option></select><button class="primary">Add</button></form>
+ <option value="agent">Agent</option><option value="human">Human</option><option value="guest">Guest (read-only)</option></select>
+ <label class="meta"><input type="checkbox" id="uglobal"> global admin</label><button class="primary">Add</button></form>"""}
 <script>
 const $ = (id) => document.getElementById(id);
 function showTok(who, token, agent) {{ $('tok').hidden = false; $('tokwho').textContent = 'Token for ' + who; $('tokval').value = token;
@@ -3055,16 +3171,150 @@ async function newToken(name, kind) {{
   if (!confirm('Give ' + name + ' a new token? Their current one stops working immediately.')) return;
   try {{ const r = await api('POST', '/api/users/' + encodeURIComponent(name) + '/token'); showTok(name, r.token, kind === 'agent' ? name : ''); }} catch (e) {{ fail(e); }}
 }}
+async function setGlobal(name, on) {{
+  try {{ await api('PATCH', '/api/users/' + encodeURIComponent(name), {{global_admin: on}}); location.reload(); }} catch (e) {{ fail(e); }}
+}}
 async function toggleUser(name, disable) {{
   try {{ await api('PATCH', '/api/users/' + encodeURIComponent(name), {{disabled: disable}}); location.reload(); }} catch (e) {{ fail(e); }}
 }}
-$('uf').onsubmit = async (e) => {{ e.preventDefault();
-  try {{ const r = await api('POST', '/api/users', {{username: $('uname').value.trim(), kind: $('ukind').value}});
+if ($('uf')) $('uf').onsubmit = async (e) => {{ e.preventDefault();
+  try {{ const r = await api('POST', '/api/users', {{username: $('uname').value.trim(), kind: $('ukind').value,
+                                                    global_admin: $('uglobal').checked}});
     showTok(r.user.username + ' (' + r.user.kind + ')', r.token, r.user.kind === 'agent' ? r.user.username : ''); $('uname').value = '';
     const note = document.createElement('p'); note.className = 'meta'; note.textContent = 'Reload to see them in the list.';
     $('tok').appendChild(note); }} catch (err) {{ fail(err); }} }};
 </script>"""
     return page("Users", body, "/users", len(store.tickets(["review"])))
+
+
+def project_switcher(store, current):
+    """The top bar's project picker: the viewer's projects; the current one selected."""
+    ps = [p for p in store.projects() if not p["archived"] or p["slug"] == current]
+    opts = "".join(f'<option value="/p/{p["slug"]}"{" selected" if p["slug"] == current else ""}>{esc(p["name"])}</option>'
+                   for p in ps)
+    admin = store.is_global_admin() or any(p["role"] == "admin" for p in ps)
+    extra = ((f'<option value="/all"{" selected" if current == "" else ""}>All my projects</option>' if admin else "")
+             + '<option value="/projects">Projects…</option>')
+    pick = "" if current else '<option value="" selected disabled>Project</option>'
+    return (f'<select class="psw" aria-label="Project" onchange="if(this.value)location=this.value">{pick}{opts}{extra}'
+            f'</select>')
+
+
+PROJECTS_JS = """
+async function newProject(e){ e.preventDefault();
+  const f = e.target;
+  try { const p = await api('POST', '/api/projects', {name: f.pname.value.trim(), slug: f.pslug.value.trim() || undefined,
+                                                       description: f.pdesc.value.trim()});
+        location = '/p/' + p.slug + '/members'; } catch (err) { fail(err); } }
+async function archive(slug, on){
+  if (on && !confirm('Archive ' + slug + '? Its members can still read it; it takes no new tickets.')) return;
+  try { await api('POST', '/api/projects/' + slug + '/archive', {archived: on}); location.reload(); } catch (e) { fail(e); } }
+"""
+
+
+def render_projects(store):
+    """The projects this viewer is in (the picker, when there's more than one); global admins add and archive them."""
+    ga = store.is_global_admin()
+    rows = []
+    for p in store.projects():
+        acts = (f'<button onclick="archive(\'{p["slug"]}\', {str(not p["archived"]).lower()})">'
+                f'{"Unarchive" if p["archived"] else "Archive"}</button>' if ga and p["slug"] != GENERAL else "")
+        rows.append(f'<div class="item"><a href="/p/{p["slug"]}" style="flex:1;min-width:0"><b>{esc(p["name"])}</b> '
+                    f'<span class="id">{p["slug"]}</span>{" <span class=chip>Archived</span>" if p["archived"] else ""}'
+                    f'<div class="meta">{p["open_tickets"]} open ticket{"s" if p["open_tickets"] != 1 else ""} · you: '
+                    f'{p["role"]}{" · " + esc(p["description"]) if p["description"] else ""}</div></a>'
+                    f'<div class="row"><a href="/p/{p["slug"]}/members">Members</a>{acts}</div></div>')
+    form = ("""<h2>Add a project</h2><form class="stack box" onsubmit="newProject(event)">
+<label>Name<input type="text" name="pname" required placeholder="Benefits Processing"></label>
+<label>Slug (optional: made from the name)<input type="text" name="pslug" placeholder="benefits-processing"></label>
+<label>Description<input type="text" name="pdesc"></label><div><button class="primary">Add project</button></div></form>"""
+            if ga else "")
+    body = (f'<h1>Projects</h1><p class="meta">One project per team. You see the projects you belong to'
+            f'{" (as a global admin, all of them)" if ga else ""}.</p><div class="list">{"".join(rows)}</div>{form}'
+            f'<script>{PROJECTS_JS}</script>')
+    return page("Projects", body, "/projects", len(store.tickets(["review"])))
+
+
+def render_project_overview(store, proj):
+    """A project at a glance: open epics, how much is ready and in progress, what waits for review, what's blocked."""
+    only = {proj["id"]}
+    epics = store.tickets(["backlog", "in_progress"], kind="epic", proposed=False, projects=only)
+    count = lambda st: len(store.tickets([st], kind="ticket", proposed=False, projects=only))
+    review = store.tickets(["review"], kind="ticket", proposed=False, projects=only)
+    blocked = [t for t in store.tickets(["backlog", "ready", "in_progress"], kind="ticket", projects=only) if t["blocked"]]
+    stat = lambda n, label, href: f'<a class="card" href="{href}"><div class="t" style="font-size:22px">{n}</div><div class="meta">{label}</div></a>'
+    base = f"/p/{proj['slug']}"
+    body = (f'<h1>{esc(proj["name"])}: overview</h1><p class="dlinks"><a href="{base}">Board</a>'
+            f'<a href="{base}/backlog">Backlog</a><a href="{base}/members">Members</a></p>'
+            f'<div class="cols">{stat(count("ready"), "ready to work", base)}{stat(count("in_progress"), "in progress", base)}'
+            f'{stat(len(review), "waiting for review", base)}{stat(len(blocked), "blocked", base)}</div>'
+            + column("Waiting for review", review, "Nothing waiting for review.")
+            + column("Blocked", blocked, "Nothing blocked.")
+            + f'<h2>Open epics ({len(epics)})</h2>'
+            + ("".join(card(e) for e in epics) or '<p class="empty">No open epics.</p>'))
+    return page(f"{proj['name']} overview", body, "/", len(review), proj["slug"])
+
+
+def render_all(store, q, only_slug):
+    """Every project the viewer runs (global admins: all; project admins: theirs), in one list, with a filter."""
+    ps = [p for p in store.projects() if store.is_global_admin() or p["role"] == "admin"]
+    if not ps:
+        raise ApiError(403, "the all-projects list is for admins: you don't run a project")
+    ids = {p["id"] for p in ps if not only_slug or p["slug"] == only_slug}
+    items = store.tickets(["backlog", "ready", "in_progress", "review"], q=q or None, recent_first=True, projects=ids)
+    opts = "".join(f'<option value="{p["slug"]}"{" selected" if p["slug"] == only_slug else ""}>{esc(p["name"])}</option>'
+                   for p in ps)
+    rows = "".join(f'<tr><td><a href="/p/{t["project"]}">{esc(t["project_name"] or "")}</a></td>'
+                   f'<td><a href="/t/{t["id"]}"><span class="id">{t["id"]}</span> {esc(t["title"])}</a></td>'
+                   f'<td><span class="chip s-{t["status"]}">{LABELS[t["status"]]}</span></td>'
+                   f'<td>{esc(t["assignee"] or "")}</td></tr>' for t in items)
+    body = (f'<h1>All my projects</h1><form class="row" method="get" style="margin-bottom:12px">'
+            f'<select name="project" aria-label="Project"><option value="">Every project</option>{opts}</select>'
+            f'<input type="search" name="q" value="{esc(q)}" placeholder="Search" aria-label="Search"><button>Show</button></form>'
+            f'<div style="overflow-x:auto"><table class="tbl"><thead><tr><th>Project</th><th>Ticket</th><th>Status</th>'
+            f'<th>Assignee</th></tr></thead><tbody>{rows or "<tr><td colspan=4 class=empty>Nothing open.</td></tr>"}</tbody>'
+            f'</table></div>')
+    return page("All projects", body, "/", len(store.tickets(["review"])), "")
+
+
+MEMBERS_JS = """
+async function setRole(slug, who, role){
+  try { await api('PUT', '/api/projects/' + slug + '/members/' + encodeURIComponent(who), {role}); location.reload(); }
+  catch (e) { fail(e); } }
+"""
+
+
+def render_members(store, proj):
+    """Who's in a project, and as what. Its admins (and global admins) add existing accounts, change roles and take
+    people out."""
+    can = store.role_in(proj["id"]) == "admin"
+    rows = []
+    for m in store.members(proj["slug"]):
+        name = json.dumps(m["username"])
+        kinds = ROLES if m["kind"] == "human" else ("member", "viewer") if m["kind"] == "agent" else ("viewer",)
+        sel = (f"<select aria-label='Role' onchange='setRole({json.dumps(proj['slug'])}, {esc(name)}, this.value)'>"
+               + "".join(f'<option{" selected" if r == m["role"] else ""}>{r}</option>' for r in kinds) + "</select>"
+               f"<button onclick='setRole({json.dumps(proj['slug'])}, {esc(name)}, null)'>Remove</button>"
+               if can else f'<span class="chip">{m["role"]}</span>')
+        rows.append(f'<div class="item"><div style="flex:1;min-width:0"><b>{esc(m["username"])}</b> '
+                    f'<span class="meta">{m["kind"]}{" · global admin" if m["global_admin"] else ""}'
+                    f'{" · disabled" if m["disabled"] else ""}</span></div><div class="row">{sel}</div></div>')
+    add = ""
+    if can:
+        inside = {m["username"].lower() for m in store.members(proj["slug"])}
+        others = [u for u in store.users() if u["username"].lower() not in inside and not u["disabled"]]
+        opts = "".join(f'<option value="{esc(u["username"])}">{esc(u["username"])} ({u["kind"]})</option>' for u in others)
+        slug_js = esc(json.dumps(proj["slug"]))
+        add = (f'<h2>Add someone</h2><form class="row box" onsubmit="event.preventDefault();'
+               f'setRole({slug_js}, this.who.value, this.role.value)">'
+               f'<select name="who" aria-label="Account">{opts}</select><select name="role" aria-label="Role">'
+               f'<option>member</option><option>viewer</option><option>admin</option></select>'
+               f'<button class="primary">Add</button></form><p class="meta">Agents are members or viewers; guests viewers; '
+               f'only humans are admins. Taking someone out unassigns their tickets here. New accounts are made on the '
+               f'Users page, by a global admin.</p>' if others else "")
+    body = (f'<h1>{esc(proj["name"])}: members</h1><p class="dlinks"><a href="/p/{proj["slug"]}">Board</a></p>'
+            f'<div class="list">{"".join(rows) or "<p class=empty>No members yet.</p>"}</div>{add}<script>{MEMBERS_JS}</script>')
+    return page(f"{proj['name']} members", body, "/", len(store.tickets(["review"])), proj["slug"])
 
 
 SETTINGS_JS = """
@@ -3412,9 +3662,10 @@ def render_ticket(store, tid):
         return f'<span class="chip s-{st}">{label}</span>'
 
     def link_list(items, removable=False):
-        lis = "".join(f'<li><a href="/t/{x["id"]}"><span class="id">{x["id"]}</span> {esc(x["title"])}</a> {chip(x)}'
+        lis = "".join((f'<li><a href="/t/{x["id"]}"><span class="id">{x["id"]}</span> {esc(x["title"])}</a> {chip(x)}'
+                       if x["id"] else f'<li><span class="meta">{esc(x["title"])}</span> {chip(x)}')
                       + (f' <button onclick="rmDep(\'{x["id"]}\')" aria-label="Remove {x["id"]}" '
-                         f'style="padding:1px 7px">×</button>' if removable else "") + "</li>" for x in items)
+                         f'style="padding:1px 7px">×</button>' if removable and x["id"] else "") + "</li>" for x in items)
         return f'<ul class="ck deps">{lis}</ul>' if lis else '<p class="meta">None.</p>'
 
     banners = ""
@@ -3428,7 +3679,7 @@ def render_ticket(store, tid):
                     + (' <span class="meta">(its proposed tickets go the same way)</span>' if t["kind"] == "epic" else "")
                     + '</div>')
     if t["blocked_by"]:
-        banners += (f'<div class="banner">Blocked: {", ".join(f"<a href=/t/{b}>{b}</a>" for b in t["blocked_by"])} '
+        banners += (f'<div class="banner">Blocked: {", ".join(b if b == store.HIDDEN else f"<a href=/t/{b}>{b}</a>" for b in t["blocked_by"])} '
                     f'must be done first. Agents can\'t start it or hand it back until then (you can still move it); '
                     f'comments are fine.</div>')
     epic_box = ""
@@ -3508,7 +3759,19 @@ def render_ticket(store, tid):
             say = "<b>Waiting on you.</b> <b>Close as done</b> if it's finished, or <b>Send back for more work</b> with what's next."
         banners += (f'<div class="banner prop">{say} <span class="meta">Agreeing with an idea that still needs '
                     f'building is a send-back: the button is about the ticket, not your verdict.</span></div>')
+    v = store._viewer()
+    mover = (v is None or v["kind"] == "human") and store.role_in(t["project_id"]) in ("admin", "member")
+    targets = [dict(r) for r in store.db().execute("SELECT slug, name FROM projects WHERE archived = 0 ORDER BY name")]
+    move = ('<div class="row" style="margin-top:8px"><label class="meta" for="mvp">Move to project</label>'
+            '<select id="mvp" class="as" onchange="moveTo(this.value)">'
+            + "".join(f'<option value="{p["slug"]}"{" selected" if p["slug"] == t["project"] else ""}>{esc(p["name"])}</option>'
+                      for p in targets)
+            + '</select></div><script>async function moveTo(slug){ if (!confirm("Move this ticket to " + slug + "? It '
+              'goes to that project\'s backlog.")) { location.reload(); return; } try { const r = await api("PATCH", '
+              '"/api/tickets/" + TID, {project: slug}); location = r.moved ? "/p/" + slug.replace(/[^a-z0-9-]/g, "") '
+              ': location.href; } catch (e) { fail(e); } }</script>') if mover else ""
     body = f"""<div class="row" style="margin-bottom:6px"><span class="id">{t['id']}</span>
+<a class="chip" href="/p/{t['project']}" title="Project">{esc(t['project_name'] or '')}</a>
 <span class="chip s-{s}">{"Cancelled" if t["cancelled"] else "Declined" if t["declined"] else (EPIC_STATES if t['kind'] == 'epic' else LABELS)[s]}</span>{'<span class="p1">High priority</span>' if t['priority'] == 1 else ''}
 <span class="meta">{'assigned to <b>' + esc(t['assignee']) + '</b>' if t['assignee'] else 'unassigned'}</span>
 {'<span class="tag epic">Epic</span>' if t['kind'] == 'epic' else ''}
@@ -3521,6 +3784,7 @@ def render_ticket(store, tid):
  <div class="box"><div class="desc md">{wiki_html(store, t['description']) or '<span class="meta">No description.</span>'}</div></div>
  <div class="row" style="margin-top:8px"><label class="meta" for="prio">Priority</label>
   <select id="prio" class="as" onchange="setPrio(this.value)">{''.join(f'<option value="{k}"{" selected" if k == t["priority"] else ""}>{v}</option>' for k, v in PRIORITIES.items())}</select></div>
+ {move}
  {epic_box}
  <h2>Activity</h2>{earlier}<div class="tl" id="tl" data-from="{view_from}">{timeline}</div>
  {unanswered}<h2>Comment</h2><form class="stack box" id="cf">
@@ -3594,7 +3858,7 @@ async function cancelTicket() {{
 async function setPrio(v) {{ try {{ await api('PATCH', '/api/tickets/' + TID, {{priority: +v}}); location.reload(); }}
   catch (err) {{ fail(err); }} }}
 </script>"""
-    return page(f"{t['id']} {t['title']}", body, "", len(store.tickets(["review"])))
+    return page(f"{t['id']} {t['title']}", body, "", len(store.tickets(["review"])), t["project"])
 
 
 TICKET_WORD = re.compile(r"\b(?:[A-Za-z]+-[A-Za-z]+|[A-Z]{4,5})\b")
@@ -3796,7 +4060,20 @@ def render_chat(store, cid, viewer):
                if msgs and store.older_messages(c["id"], msgs[0]["id"]) else "")
     last = msgs[-1]["id"] if msgs else 0
     others = [u for u in store.users() if not u["disabled"] and u["kind"] != "guest"
-              and u["username"].lower() not in {m.lower() for m in c["members"]}]
+              and u["username"].lower() not in {m.lower() for m in c["members"]}
+              and (c["project_id"] is None or store._in_project(u["username"], c["project_id"]))]
+    # Who can read it: everyone, or one project's members. Admins of a project (and global admins) change it.
+    admin_of = [p for p in store.projects(include_archived=False) if p["role"] == "admin"]
+    can_scope = admin_of and (c["project_id"] is None or store.role_in(c["project_id"]) == "admin")
+    scope_note = (f'Only <a href="/p/{c["project"]}">{esc(c["project"])}</a>\'s members can see and post here.'
+                  if c["project"] else "Anyone can read and post here (guests read).")
+    scope = scope_note + ((' <select aria-label="Who can see it" style="width:auto" onchange="scopeChat(this.value)">'
+                           '<option value="">Everyone</option>'
+                           + "".join(f'<option value="{p["slug"]}"{" selected" if p["slug"] == c["project"] else ""}>'
+                                     f'{esc(p["name"])} only</option>' for p in admin_of) + '</select>'
+                           '<script>async function scopeChat(v){ try { await api("PATCH", "/api/chat/" + '
+                           f'{c["id"]}, {{project: v || null}}); location.reload(); }} catch (e) {{ fail(e); location.reload(); }} }}'
+                           '</script>') if can_scope else "")
     add = ""
     if others:
         opts = "".join(f'<option value="{esc(u["username"])}">{esc(u["username"])}</option>' for u in others)
@@ -3806,7 +4083,7 @@ def render_chat(store, cid, viewer):
     body = f"""<p class="meta" style="margin:0 0 4px"><a href="/chat">← Chat</a></p>
 <div class="row" style="justify-content:space-between;align-items:baseline"><h1 style="margin-bottom:4px">{esc(c["name"])}</h1>
 <button type="button" class="cancel" onclick="deleteChat()">Delete chat</button></div>
-<div class="meta">With {esc(", ".join(c["members"]) or "no one yet")}. Anyone can read and post here.</div>{add}
+<div class="meta">With {esc(", ".join(c["members"]) or "no one yet")}. {scope}</div>{add}
 <div id="chatroom" data-cid="{c["id"]}" data-last="{last}" style="margin-top:14px">{earlier}
 <div class="chat" id="msgs">{shown or '<p class="empty" id="none">No messages yet. Say hello.</p>'}</div>
 <p class="meta receipt" id="receipt">{receipt_html(store, c["id"])}</p>
@@ -3979,6 +4256,7 @@ if (wf) wf.onsubmit = async (e) => {
   const data = {title: $('wtitle').value, body: $('wbody').value};
   if ($('wslug')) data.slug = $('wslug').value;
   if ($('wparent')) data.parent = $('wparent').value;
+  if ($('wproj')) data.project = $('wproj').value;
   try {
     const p = WPATH ? await api('PATCH', '/api/wiki/' + WPATH, data) : await api('POST', '/api/wiki', data);
     location.href = '/wiki/' + p.path;
@@ -3996,11 +4274,21 @@ def wiki_form(store, page_=None, parent=None):
     p = page_ or {}
     here = p.get("path")
     parent_path = here.rsplit("/", 1)[0] if here and "/" in here else (parent if not here else "")
+    if here:
+        cur = p.get("project") or ""
+    else:                                     # a new page: its parent's project, else board-wide
+        try:
+            cur = (store.wiki_page(parent_path).get("project") or "") if parent_path else ""
+        except ApiError:
+            cur = ""
+    popts = '<option value="">Everyone (board-wide)</option>' + "".join(
+        f'<option value="{x["slug"]}"{" selected" if x["slug"] == cur else ""}>{esc(x["name"])} only</option>'
+        for x in store.projects(include_archived=False))
     return f"""<form class="stack box" id="wf">
 <label>Title<input type="text" id="wtitle" required value="{esc(p.get('title', ''))}"></label>
 <div class="row"><label style="flex:1;min-width:180px">Under<select id="wparent">{wiki_parent_options(store, here, parent_path)}</select></label>
 <label style="flex:1;min-width:140px">Address (optional)<input type="text" id="wslug" value="{esc(p.get('slug', ''))}"
- placeholder="from the title"></label></div>
+ placeholder="from the title"></label><label style="flex:1;min-width:160px">Who sees it<select id="wproj">{popts}</select></label></div>
 <label>Text<textarea id="wbody" rows="18" style="font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace">{esc(p.get('body', ''))}</textarea></label>
 <div class="row"><button class="primary">Save</button>{'<button type="button" onclick="wdel()">Delete page</button>' if here and not p.get('children') else ''}</div>
 </form><script>const WPATH = {json.dumps(here or "")};{WIKI_EDIT_JS}</script>"""
@@ -4097,6 +4385,16 @@ you), answer them there, where they're waiting. Reply where you're spoken to; to
 4. Read the whole ticket (`GET /api/tickets/ID`): description, every comment, checklist, and every page
    in its `wiki_links` (`GET /api/wiki/PATH`).
 5. Unfamiliar project? Check the wiki first: `GET /api/wiki` (the tree), `GET /api/wiki?q=a+few+words`.
+
+## Projects
+
+The board has one project per team (`GET /api/projects`: yours, with your role in each). You see and work
+only your projects: a member works in one, a viewer only reads it. Anything in a project you're not in
+doesn't exist for you (404). New tickets and proposals go in a project: `POST /api/tickets` with
+`"project": "SLUG"` (no project: `general`). `POST /api/next` and `GET /api/wait` cover all your projects;
+narrow them with `project` (`{{"project": "records"}}`, or `?project=records,legal`). Each ticket says its
+`project`. A dependency on a ticket you can't see shows as "a ticket in another project": it still blocks.
+Only humans move tickets between projects.
 
 ## Working a ticket
 
@@ -4265,6 +4563,24 @@ first (create them in order, so the ids exist). Give every ticket a
 description that someone else could work from cold, and say what "done"
 means. The human accepts or declines the epic, and with it all of its
 proposed tickets, in one step.
+
+## Projects
+
+The board has one project per team. `GET /api/projects` lists yours, with
+your role in each: a **member** works in it, a **viewer** only reads it
+(project **admins** also manage its members; global admins run every
+project). You see only your projects' tickets, wiki pages and team chats:
+anything else is 404, as if it weren't there.
+
+- New tickets and proposals go in a project: `POST /api/tickets` with
+  `"project": "records"` (none given: `general`).
+- `POST /api/next` and `GET /api/wait` cover all your projects; narrow them
+  with `project`: `{"project": "records"}`, or `?project=records,legal`.
+- `GET /api/tickets?project=records` lists one project's tickets. Each
+  ticket says its `project`.
+- Dependencies and epics can cross projects. A ticket you can't see shows
+  as "a ticket in another project", with no title, and still blocks.
+- Only humans move tickets between projects (`PATCH` with `"project"`).
 
 ## How to work a ticket
 
@@ -4639,7 +4955,9 @@ def docs_for(store, actor, role):
         head = API_DOCS.split("\n## Signing in", 1)
         return (head[0] + "\n## Guidance from your humans\n\nFollow this; it overrides the general advice below.\n\n"
                 + store.house_guidance().strip() + "\n\n## Signing in" + head[1])
-    counts = {st: n for st, n in store.db().execute("SELECT status, COUNT(*) FROM tickets GROUP BY status")}
+    see, see_args = store._see_sql()
+    counts = {st: n for st, n in store.db().execute(f"SELECT status, COUNT(*) FROM tickets t WHERE {see} GROUP BY status",
+                                                     see_args)}
     # Tickets this user moved to in_progress most recently, and still in progress.
     mine = [dict(r) for r in store.db().execute(
         "SELECT id, title FROM tickets WHERE status = 'in_progress' AND assignee = ? COLLATE NOCASE "
@@ -4650,6 +4968,9 @@ def docs_for(store, actor, role):
     unread = (sum(c["count"] for c in store.chat_attention(actor)) if role == "agent"
               else store.unread_total(actor))
     lines = [f"\n## Right now\n", f"You're signed in as **{actor}** ({role})."]
+    mine_p = [p for p in store.projects() if not p["archived"]]
+    lines.append("Your projects: " + ", ".join(f"`{p['slug']}` ({p['role']})" for p in mine_p) + ". You see and work "
+                 "only these; `POST /api/next` and `GET /api/wait` cover them all unless you pass `project`.")
     if unread:
         lines.append(f"**You have {unread} chat message{'s' if unread != 1 else ''} to answer. Reply first:** "
                      "`GET /api/chat/inbox`.")
@@ -4822,6 +5143,9 @@ class Handler(BaseHTTPRequestHandler):
         role, actor = getattr(self, "who_is", (None, None))
         n = self.server.store.unread_total(actor) if actor else 0
         body = body.replace(CHAT_BADGE, f"<span class=n>{n}</span>" if n else "", 1)
+        m = re.search(r"<!--projects:([a-z0-9-]*)-->", body)
+        if m:
+            body = body.replace(m.group(0), project_switcher(self.server.store, m.group(1)) if actor else "", 1)
         if actor and self.server.store.prefs(actor)["tts"]:
             body = body.replace('<html lang="en">', '<html lang="en" data-tts="1">', 1)
         if role == "guest":
@@ -4949,7 +5273,25 @@ class Handler(BaseHTTPRequestHandler):
             m = re.fullmatch(rf"/api/tickets/({ID_PATH})(/comments|/attachments|/checklist|/deps|/accept|/decline|/cancel)?(?:/({ID_PATH}))?",
                              path)
             if method == "GET" and path == "/":
-                return self.html(render_dashboard(store))
+                # Straight to your project if you have one; a picker if you have several.
+                mine = store.projects(include_archived=False)
+                if len(mine) == 1:
+                    return self.redirect(f"/p/{mine[0]['slug']}")
+                return self.html(render_projects(store))
+            if method == "GET" and path == "/projects":
+                return self.html(render_projects(store))
+            if method == "GET" and path == "/all":
+                return self.html(render_all(store, (query.get("q") or [""])[0].strip(),
+                                            (query.get("project") or [""])[0].strip()))
+            if method == "GET" and (pv := re.fullmatch(r"/p/([a-z0-9-]+)(/backlog|/done|/dashboard|/members)?", path)):
+                proj, view = store.project(pv.group(1)), pv.group(2)
+                if not view:
+                    return self.html(render_dashboard(store, proj))
+                if view == "/dashboard":
+                    return self.html(render_project_overview(store, proj))
+                if view == "/members":
+                    return self.html(render_members(store, proj))
+                return self.html(render_list(store, view[1:], (query.get("q") or [""])[0].strip(), proj))
             if method == "GET" and path in ("/backlog", "/done"):
                 return self.html(render_list(store, path[1:], (query.get("q") or [""])[0].strip()))
             if method == "GET" and path == "/new":
@@ -4957,7 +5299,8 @@ class Handler(BaseHTTPRequestHandler):
                 after = store.ticket((query.get("after") or [""])[0]) if query.get("after") else None
                 epic = (query.get("epic") or [None])[0] or (after["epic_id"] if after else None)
                 return self.html(render_new(store, epic, ticket_from_message(store, int(mid)) if mid.isdigit()
-                                            else ("", ""), after))
+                                            else ("", ""), after,
+                                            (query.get("project") or [""])[0] or (after["project"] if after else None)))
             if method == "GET" and (tm := re.fullmatch(rf"/t/({ID_PATH})/live", path)):
                 start = (query.get("from") or ["0"])[0]
                 return self.json(200, ticket_live(store, tm.group(1), float(start) if re.fullmatch(r"[0-9.]+", start) else 0))
@@ -5217,7 +5560,7 @@ class Handler(BaseHTTPRequestHandler):
             if method == "GET":
                 return self.json(200, {"conversations": store.conversations(actor), "unread": store.unread_total(actor)})
             if method == "POST":
-                cid = store.start_conversation(self.body_json(("members", "title", "body")), actor, role)
+                cid = store.start_conversation(self.body_json(("members", "title", "body", "project")), actor, role)
                 return self.json(201, store.conversation_detail(cid, actor, mark=False))
         if path == "/api/chat/inbox" and method == "GET":
             # Agents: everything they still owe (human messages until they reply). Humans: unread.
@@ -5240,6 +5583,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self.json(200, store.delete_conversation(cid, role))
             if not sub and method == "GET":
                 return self.json(200, store.conversation_detail(cid, actor, mark=False))
+            if not sub and method == "PATCH":
+                d = self.body_json(("project",))
+                if "project" not in d:
+                    raise ApiError(400, 'send {"project": "SLUG"} to make it that project\'s chat, or {"project": null}')
+                return self.json(200, store.set_chat_project(cid, d["project"], actor))
             if sub == "/messages" and method == "GET":
                 # ?before=ID: the page of older messages; ?after=ID: everything newer.
                 num = lambda k: int(v) if (v := (query.get(k) or [""])[0]).isdigit() else None
