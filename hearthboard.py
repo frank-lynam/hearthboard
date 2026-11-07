@@ -300,7 +300,7 @@ CREATE INDEX IF NOT EXISTS events_ticket ON events(ticket_id, at);
 """
 
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 # Bumped whenever the tables change. A board made by an older version won't open until a person runs
 # `hearthboard --upgrade` (it backs up first); hearthboard never changes an install on its own.
