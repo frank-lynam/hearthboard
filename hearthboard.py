@@ -3167,6 +3167,11 @@ def render_users(store, me):
                     f'<div class="meta">added {when(u["created_at"])}{" by " + esc(u["created_by"]) if u["created_by"] else ""}'
                     f' · last seen {seen}</div><div class="meta">projects: {projs or "none"}</div></div>'
                     f'<div class="row">{acts}</div></div>')
+    # its own string: a """ inside the f-string below only parses on Python 3.12+
+    add_form = "" if not ga else """<h2>Add a user</h2><form class="row box" id="uf"><input type="text" id="uname" placeholder="name, e.g. agent-1"
+ aria-label="Username" style="flex:1;min-width:160px" required><select id="ukind" style="width:auto" aria-label="Kind">
+ <option value="agent">Agent</option><option value="human">Human</option><option value="guest">Guest (read-only)</option></select>
+ <label class="meta"><input type="checkbox" id="uglobal"> global admin</label><button class="primary">Add</button></form>"""
     body = f"""<h1>Users</h1>
 <p class="meta">Accounts are board-wide; what each one can see and do depends on its projects. <b>Global admins</b>
 run every project and do the account work (adding users, tokens, disabling, global admins). A project's
@@ -3182,10 +3187,7 @@ the machine it'll work on. For a hobkin you already have, change <code>--id</cod
 machine with no model set up yet, put <code>API_URL MODEL KEY</code> in front:</p>
 <div class="row"><input type="text" id="hobkincmd" readonly><button onclick="copyTok('hobkincmd')">Copy</button></div></div></div>
 <div class="list">{"".join(rows)}</div>
-{'' if not ga else """<h2>Add a user</h2><form class="row box" id="uf"><input type="text" id="uname" placeholder="name, e.g. agent-1"
- aria-label="Username" style="flex:1;min-width:160px" required><select id="ukind" style="width:auto" aria-label="Kind">
- <option value="agent">Agent</option><option value="human">Human</option><option value="guest">Guest (read-only)</option></select>
- <label class="meta"><input type="checkbox" id="uglobal"> global admin</label><button class="primary">Add</button></form>"""}
+{add_form}
 <script>
 const $ = (id) => document.getElementById(id);
 function showTok(who, token, agent) {{ $('tok').hidden = false; $('tokwho').textContent = 'Token for ' + who; $('tokval').value = token;
