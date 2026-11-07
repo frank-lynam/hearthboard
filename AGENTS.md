@@ -3,6 +3,10 @@
 This file is for agents changing this repo. Agents *using* the tracker
 read `GET /api` on the running server instead.
 
+- **Finding your way:** `grep -n '^# ----' hearthboard.py` lists the file's sections (the map near
+  the top says what each holds), and `grep -n '# --- '` lists Store's and Handler's parts and the
+  URL groups in `Handler.route`. Read the section you need with an offset rather than the whole
+  file. New code goes in the section it belongs to; keep the map in step.
 - **Standard library only.** No pip installs, no frameworks, no build
   step, no CDN assets in the pages. It's one file, `hearthboard.py`;
   keep it that way unless it truly outgrows it.

@@ -57,6 +57,28 @@ from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
+# ---- map: `grep -n '^# ----' hearthboard.py` lists these sections; `grep -n '# --- ' hearthboard.py` lists Store's
+#      and Handler's parts, and the URL groups inside Handler.route.
+#   basics        statuses, epic states, two-word ticket ids
+#   checklists    an agent's uploaded markdown checklist, parsed and summarized
+#   storage       the schema, roles, the house rules, tokens, and Store: who's asking, users, guidance, projects,
+#                 reads, writes, wiki, waiting (long polls), chat
+#   backups       --export and --import
+#   html          themes, the page CSS, text helpers
+#   board pages   the page frame, dashboard, lists, new tickets, pickers
+#   people pages  users, projects and members, settings, login, guidance
+#   ticket page   attachments, timeline, checklists, live updates
+#   chat pages    inline markdown, messages, the chat list and a conversation
+#   wiki pages    the wiki's markdown, index, pages and forms
+#   api docs      the agent skill and the GET /api briefing
+#   http          Handler: auth, responses, routing (every URL is in Handler.route)
+#   command line  settings from the environment, the data folder
+#   services      systemd user services (the server, a nightly backup)
+#   main          the server, --upgrade, one-off commands, cli()
+
+
+# ---- basics: statuses, epic states, two-word ticket ids
+
 STATUSES = ["backlog", "ready", "in_progress", "review", "done"]
 LABELS = {"backlog": "Backlog", "ready": "Ready", "in_progress": "In progress", "review": "Needs review", "done": "Done"}
 # An epic's state follows its tickets (declined ones don't count), stored as
@@ -176,7 +198,7 @@ def new_id(taken, pick=random.choice):
     raise RuntimeError("no free ticket id")
 
 
-# --------------------------------------------------------------------------- checklists
+# ---- checklists: an agent's uploaded markdown checklist, parsed and summarized
 
 # An agent keeps its checklist in a markdown file on its own machine and
 # uploads the whole file after each step: a report, replacing the last one.
@@ -214,7 +236,7 @@ def checklist_summary(t, items=False):
     return out
 
 
-# --------------------------------------------------------------------------- storage
+# ---- storage: the schema, roles, the house rules, tokens, and Store (every read and write, scoped per request)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tickets (
@@ -2110,9 +2132,7 @@ class Store:
         return self.chat_file_json(self.chat_file(fid))
 
 
-# --------------------------------------------------------------------------- keys
-
-# --------------------------------------------------------------------------- backups
+# ---- backups: --export and --import (a versioned export.json plus files, in a .tar.gz)
 #
 # A backup is a .tar.gz holding export.json and files/<ticket>/<file>.
 # export.json is plain and versioned, one list of rows per table, so a
@@ -2257,7 +2277,7 @@ def import_archive(store, src, replace=False):
     return {t: len(doc["tables"].get(t, [])) for t in TABLES} | {"files": restored, "missing_files": len(doc.get("missing_files", []))}
 
 
-# --------------------------------------------------------------------------- HTML
+# ---- html: themes, the page CSS, and text helpers (escaping, times, links)
 
 # Themes: name -> (label, palette, light or dark). Light is the default and
 # Dark follows the device under Auto; Goth rave has extra rules in the CSS.
@@ -2732,6 +2752,9 @@ def linkify(text):
 CHAT_BADGE = "<!--chat-badge-->"
 
 
+# ---- board pages: the page frame, cards and columns, the dashboard, lists, new tickets, pickers
+
+
 def page(title, body, active="", review_count=0, project=None):
     """A whole page. `project`: the project it's about (the top bar's switcher shows it; Handler.html fills it in)."""
     tabs = [("/", "Dashboard"), ("/chat", "Chat"), ("/wiki", "Wiki"),
@@ -3120,6 +3143,9 @@ def render_new(store, epic=None, prefill=("", ""), after=None, project=None):
     return page("New ticket", body, "/new", len(store.tickets(["review"])), project)
 
 
+# ---- people pages: users, projects and members, settings, login, guidance
+
+
 def render_users(store, me):
     ga = store.is_global_admin()
     rows = []
@@ -3422,6 +3448,9 @@ TEXT_MIME = {"application/json", "application/javascript", "application/xml", "a
              "application/x-yaml", "application/yaml", "application/sql"}
 PREVIEW_BYTES = 256 * 1024
 PREVIEW_LINES = 400
+
+
+# ---- ticket page: attachments, the timeline, checklists, live updates, the ticket itself
 
 
 def text_preview(store, a):
@@ -3864,6 +3893,9 @@ async function setPrio(v) {{ try {{ await api('PATCH', '/api/tickets/' + TID, {{
 TICKET_WORD = re.compile(r"\b(?:[A-Za-z]+-[A-Za-z]+|[A-Z]{4,5})\b")
 
 
+# ---- chat pages: inline markdown, messages, receipts, the chat list and a conversation
+
+
 # Inline markdown, applied to escaped plain text only (never inside a link we made), with boundaries so that
 # snake_case_names, 2 * 3 * 4 and the like stay as typed.
 EMPHASIS = [
@@ -4092,6 +4124,9 @@ def render_chat(store, cid, viewer):
 <button class="primary" id="msend" style="margin-left:auto">Send</button></div></form></div>
 <script>{CHAT_JS}</script>"""
     return page(c["name"], body, "/chat", len(store.tickets(["review"])))
+
+
+# ---- wiki pages: code blocks, lists and tables, the wiki's markdown, its index, pages and forms
 
 
 def code_block(lines):
@@ -4349,6 +4384,9 @@ def render_wiki_page(store, path, role, history=False, rev=None, edit=False):
             f'<div class="meta" style="margin-top:8px">{meta}</div>{actions}{main}'
             + (f'<h2>Pages under this</h2><ul class="tree box" style="padding:12px 16px">{kids}</ul>' if kids else ""))
     return page(p["title"], body, "/wiki", len(store.tickets(["review"])))
+
+
+# ---- api docs: the skill an agent saves, and the GET /api briefing (docs_for)
 
 
 def skill_md(base):
@@ -4997,7 +5035,7 @@ def docs_for(store, actor, role):
             + guidance + "\n\n## Signing in" + head[1] + "\n".join(lines) + "\n")
 
 
-# --------------------------------------------------------------------------- HTTP
+# ---- http: Handler (auth, responses, every route), and what each request body may contain
 
 def what_now(t, me):
     """One line telling an agent what a ticket means for it, right now."""
@@ -5244,6 +5282,7 @@ class Handler(BaseHTTPRequestHandler):
             role, actor, bearer = self.who(query)
             self.who_is = (role, actor)
             store.set_viewer(actor, role)       # everything below sees only what this caller can
+            # --- routes: sign-in and the briefing (no token needed)
             # The briefing is public (it's only documentation); with a token
             # it adds who's asking and what's waiting. An agent calling the
             # base URL with its token gets it too, instead of the web page.
@@ -5262,6 +5301,7 @@ class Handler(BaseHTTPRequestHandler):
                     raise ApiError(401, "missing, wrong or disabled token (Authorization: Bearer <token>). "
                                         "How this works: GET /api")
                 return self.redirect("/login?next=" + quote(path + (f"?{url.query}" if url.query else ""), safe=""))
+            # --- routes: guests, and same-origin checks for cookie changes
             # Guests read; the only thing they can change is their own display settings.
             if role == "guest" and (method not in ("GET", "HEAD") and path != "/api/me/prefs"
                                     or path in ("/new", "/wiki-new")):
@@ -5272,6 +5312,7 @@ class Handler(BaseHTTPRequestHandler):
 
             m = re.fullmatch(rf"/api/tickets/({ID_PATH})(/comments|/attachments|/checklist|/deps|/accept|/decline|/cancel)?(?:/({ID_PATH}))?",
                              path)
+            # --- routes: board pages (dashboard, projects, lists, new), ticket pages and files, chat pages
             if method == "GET" and path == "/":
                 # Straight to your project if you have one; a picker if you have several.
                 mine = store.projects(include_archived=False)
@@ -5331,6 +5372,7 @@ class Handler(BaseHTTPRequestHandler):
                     store.mark_read(cid, actor, msgs[-1]["id"])
                 return self.json(200, {"html": "".join(render_message(store, m, actor) for m in msgs),
                                        "last": msgs[-1]["id"] if msgs else 0, "receipt": receipt_html(store, cid)})
+            # --- routes: the wait loop, chat API, skill, wiki pages and API
             if method == "GET" and path == "/api/wait":
                 t = (query.get("timeout") or ["50"])[0]
                 timeout = max(1, min(300, int(t) if t.isdigit() else 50))
@@ -5391,6 +5433,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self.json(200, {"members": store.set_member(slug, unquote(who_), d["role"], actor)})
                 raise ApiError(404, "not found")
             um = re.fullmatch(r"/api/users(?:/([^/]+))?(/token)?", path)
+            # --- routes: people (users, me, prefs, guidance, settings), projects and members, export
             if method == "GET" and path == "/users":
                 if role != "human":
                     raise ApiError(403, "only humans manage users")
@@ -5462,6 +5505,7 @@ class Handler(BaseHTTPRequestHandler):
                 if role != "human" or not store.is_global_admin():
                     raise ApiError(403, "only global admins can export (a backup holds every project)")
                 return self.serve_export()
+            # --- routes: claiming (/api/next), ticket list and create, one ticket and its parts
             if path == "/api/next" and method == "GET":
                 raise ApiError(405, "take a ticket with POST /api/next; to see what to do, GET /api/wait")
             if path == "/api/next" and method == "POST":
@@ -5688,6 +5732,9 @@ class Handler(BaseHTTPRequestHandler):
                 left -= len(chunk)
 
 
+# ---- command line: settings from the environment, the data folder
+
+
 def setting_env(name: str, default=None):
     """$HEARTHBOARD_<name>."""
     return os.environ.get(f"HEARTHBOARD_{name}") or default
@@ -5708,7 +5755,7 @@ def command_line() -> str:
     return f"{sys.executable} {os.path.abspath(__file__)}"
 
 
-# ---- systemd user services: the server, and a nightly backup
+# ---- services: systemd user services: the server, and a nightly backup
 
 SERVICE_UNIT = """[Unit]
 Description=hearthboard: ticket tracker for AI agents
@@ -5801,6 +5848,9 @@ def cmd_service(argv):
           f"nightly backup at 03:30 into {backups} (keeping {a.keep})\n"
           f"logs: journalctl --user -u hearthboard" + ("" if state == "active" else
           "\nIt didn't stay up: see the logs"))
+
+
+# ---- main: the server, --upgrade, the one-off commands (--add-user, --export, ...), cli()
 
 
 def make_server(host, port, data_dir, max_upload_mb=1024):
