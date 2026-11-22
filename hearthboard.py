@@ -3309,7 +3309,8 @@ def render_profile(store, name):
         if store.can_watch(u["username"]):
             now = (f'{esc(box["status"] or "")}{" · " + esc(box["goal"]) if box.get("goal") else ""} · '
                    f'heard from {ago(box["at"]) or "just now"}' if box and box.get("at") else
-                   "nothing heard from it yet (its harness sends this: hobkin does)")
+                   "nothing heard from it yet. Its harness sends this: hobkin 0.6.3 or later, joined to this board with that "
+                   "version (an agent that joined earlier: run its --hearthboard line again with --id NAME)")
             live = (f'<p class="box"><a class="primary" href="/u/{quote(u["username"], safe="")}/live">Watch it live</a>'
                     f' <span class="meta">{now}</span></p>')
         else:
