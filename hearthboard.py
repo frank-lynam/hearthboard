@@ -5796,8 +5796,36 @@ def quote_arg(a: str) -> str:
     return f'"{a}"' if " " in a else a
 
 
+class HelpFormat(argparse.RawDescriptionHelpFormatter):
+    """--help laid out the way hobkin, lorewell, eaveswatch, atone and hearthboard all do it: a short usage line,
+    then each command and option on one line with what it does (argparse's {a,b,c} list of choices left out)."""
+
+    def __init__(self, prog):
+        super().__init__(prog, max_help_position=26, width=min(100, shutil.get_terminal_size((100, 24)).columns))
+
+    def _format_action(self, action):
+        if isinstance(action, argparse._SubParsersAction):
+            return "".join(self._format_action(a) for a in action._get_subactions())
+        return super()._format_action(action)
+
+    @classmethod
+    def everywhere(cls, parser, prog=None):
+        """This layout for a parser and all its commands, at every level: commands shown as COMMAND, and listed
+        under "commands" (or "arguments", where there are others too)."""
+        parser.formatter_class = cls
+        subs = [a for a in parser._positionals._group_actions if isinstance(a, argparse._SubParsersAction)]
+        for action in subs:
+            action.metavar = action.metavar or "COMMAND"
+            for each in action.choices.values():
+                cls.everywhere(each)
+        if subs:
+            parser._positionals.title = "commands" if len(subs) == len(parser._positionals._group_actions) else "arguments"
+        return parser
+
+
 def cmd_service(argv):
-    ap = argparse.ArgumentParser(prog="hearthboard service",
+    ap = argparse.ArgumentParser(prog="hearthboard service", usage="hearthboard service add|remove [options]",
+                                 formatter_class=HelpFormat,
                                  description="Run hearthboard as a systemd user service (now and at boot), "
                                              "with a nightly backup at 03:30.")
     ap.add_argument("action", choices=["add", "remove"])
@@ -5866,16 +5894,25 @@ def make_server(host, port, data_dir, max_upload_mb=1024):
 
 def main():
     ap = argparse.ArgumentParser(
-        description=" ".join(__doc__.split("\n\n")[0].split()),
-        epilog="As a service: hearthboard service add [--host H] [--port P] [--data D] (a systemd user service, "
-               "now and at boot, with a nightly backup); hearthboard service remove stops it. "
-               "Details: hearthboard service --help.")
-    ap.add_argument("--host", default=setting_env("HOST", "127.0.0.1"))
-    ap.add_argument("--port", type=int, default=int(setting_env("PORT", 43917)))
-    ap.add_argument("--version", action="version", version=f"hearthboard {__version__}")
+        prog="hearthboard", usage="hearthboard [options]   or   hearthboard service add|remove [options]",
+        formatter_class=HelpFormat,
+        description="hearthboard: a small ticket tracker for AI agents and the human who reviews their work.\n"
+                    "Python standard library only: a threaded HTTP server and an SQLite database. Data lives in\n"
+                    "$HEARTHBOARD_DATA, else ~/.local/share/hearthboard.",
+        epilog="examples:\n"
+               "  hearthboard                               serve on 127.0.0.1:43917\n"
+               "  hearthboard --add-user frank --kind human  make yourself a user (prints the token)\n"
+               "  hearthboard service add --host 0.0.0.0    a systemd user service, now and at boot, backed up\n"
+               "                                            nightly (service remove stops it)\n"
+               "  hearthboard --export backups/             back everything up\n\n"
+               "hearthboard service --help: the service's options. More: https://github.com/frank-lynam/hearthboard")
+    ap.add_argument("--host", default=setting_env("HOST", "127.0.0.1"),
+                    help="address to listen on (default 127.0.0.1; 0.0.0.0 for other machines)")
+    ap.add_argument("--port", type=int, default=int(setting_env("PORT", 43917)), help="port (default 43917)")
+    ap.add_argument("--version", action="version", version=f"hearthboard {__version__}", help="show the version and exit")
     ap.add_argument("--data", default=default_data_dir(),
                     help="folder for the database, uploads and keys")
-    ap.add_argument("--max-upload-mb", type=int, default=int(setting_env("MAX_UPLOAD_MB", 1024)))
+    ap.add_argument("--max-upload-mb", type=int, default=int(setting_env("MAX_UPLOAD_MB", 1024)), help="the largest upload, in MB (default 1024)")
     ap.add_argument("--add-user", metavar="NAME", help="add a user, print their token, and exit")
     ap.add_argument("--kind", choices=KINDS, default="agent", help="with --add-user: human or agent (default agent)")
     ap.add_argument("--global-admin", action="store_true",
