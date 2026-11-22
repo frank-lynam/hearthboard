@@ -3302,7 +3302,7 @@ def render_profile(store, name):
     c = u["counts"]
     stat = lambda n, label: f'<div class="card"><div class="t" style="font-size:22px">{n}</div><div class="meta">{label}</div></div>'
     stats = (f'<div class="cols">{stat(c["in_progress"], "in progress")}{stat(c["ready"], "ready")}'
-             f'{stat(c["review"], "waiting for review")}{stat(c["done"], "done")}</div>')
+             f'{stat(c["review"], "waiting for review")}{stat(c["backlog"], "backlog")}{stat(c["done"], "done")}</div>')
     live = ""
     if agent:
         box = store.live.get(u["username"].lower())
@@ -3322,9 +3322,9 @@ def render_profile(store, name):
     return page(u["username"], body, "/users")
 
 
-LIVE_JS = """
+AGENT_LIVE_JS = """
 const box = document.getElementById('live'), state = document.getElementById('lstate');
-let after = 0, stuck = true;
+let after = 0, stuck = true, first = true;
 box.addEventListener('scroll', () => { stuck = box.scrollTop + box.clientHeight >= box.scrollHeight - 30; });
 function line(t) {
   const d = document.createElement('div'), m = t.match(/^(\\d\\d:\\d\\d:\\d\\d) ([^>]{1,40})> ([\\s\\S]*)$/);
@@ -3338,7 +3338,9 @@ function line(t) {
 }
 async function poll() {
   try {
-    const r = await fetch('/api/live/' + encodeURIComponent(AGENT) + '?wait=25&after=' + after, {credentials: 'same-origin'});
+    const r = await fetch('/api/live/' + encodeURIComponent(AGENT) + '?wait=' + (first ? 0 : 25) + '&after=' + after,
+                          {credentials: 'same-origin'});
+    first = false;
     if (!r.ok) { state.textContent = r.status === 403 ? "you can't watch it any more" : 'the board went away; trying again'; setTimeout(poll, 5000); return; }
     const j = await r.json();
     if (after && j.seq < after) { box.textContent = ''; }
@@ -3364,7 +3366,7 @@ def render_live(store, name):
             f'<div class="live" id="live" aria-live="polite"></div>'
             f'<p class="meta">What it says as it works, as its terminal shows it (the last {LIVE_KEEP} lines; '
             f'kept in memory, not saved). Its tickets and chat are the record.</p>'
-            f'<script>const AGENT = {json.dumps(u["username"])};{LIVE_JS}</script>')
+            f'<script>const AGENT = {json.dumps(u["username"])};{AGENT_LIVE_JS}</script>')
     return page(f"{u['username']}: live", body, "/users")
 
 
