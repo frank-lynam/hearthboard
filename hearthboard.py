@@ -5865,7 +5865,11 @@ def make_server(host, port, data_dir, max_upload_mb=1024):
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap = argparse.ArgumentParser(
+        description=" ".join(__doc__.split("\n\n")[0].split()),
+        epilog="As a service: hearthboard service add [--host H] [--port P] [--data D] (a systemd user service, "
+               "now and at boot, with a nightly backup); hearthboard service remove stops it. "
+               "Details: hearthboard service --help.")
     ap.add_argument("--host", default=setting_env("HOST", "127.0.0.1"))
     ap.add_argument("--port", type=int, default=int(setting_env("PORT", 43917)))
     ap.add_argument("--version", action="version", version=f"hearthboard {__version__}")
