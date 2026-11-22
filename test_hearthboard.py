@@ -566,7 +566,7 @@ class TicketsTest(unittest.TestCase):
         # Filters, the timeline and the briefing.
         mine = self.j("GET", "/api/tickets?assignee=me", role=None, token=a2)[1]["tickets"]
         self.assertEqual({t["id"] for t in mine}, {for_b["id"], n2["id"]})
-        self.assertIn("assigned it to <b>agent-b</b>", self.call("GET", f"/t/{for_b['id']}", role="human")[1].decode())
+        self.assertIn('assigned it to <b><a class="who-link" href="/u/agent-b">agent-b</a></b>', self.call("GET", f"/t/{for_b['id']}", role="human")[1].decode())
         brief = self.call("GET", "/api", role=None, token=a2)[1].decode()
         self.assertIn(f"{for_b['id']}: for b", brief)  # assigned and ready
         self.assertIn(f"{n2['id']}: anyone", brief)    # in progress
@@ -1469,7 +1469,7 @@ class TicketsTest(unittest.TestCase):
         self.assertTrue(ticket["what_now"].startswith("Frank left 2 new comments here: read them and reply on this ticket first."))
         self.assertEqual(self.j("GET", "/api/me", role=None, token=tok)[1]["comments_to_answer"], 2)
         self.assertIn("Comments from humans waiting for your reply", self.call("GET", "/api", role=None, token=tok)[1].decode())
-        self.assertIn("agent-cm hasn't answered 2 comments yet", self.call("GET", f"/t/{t['id']}", role="human")[1].decode())
+        self.assertIn('<a class="who-link" href="/u/agent-cm">agent-cm</a> hasn\'t answered 2 comments yet', self.call("GET", f"/t/{t['id']}", role="human")[1].decode())
         # ...until it replies on the ticket.
         self.j("POST", f"/api/tickets/{t['id']}/comments", {"body": "Got it, renaming."}, role=None, token=tok)
         self.assertEqual(W()["reason"], "timeout")
@@ -1485,7 +1485,7 @@ class TicketsTest(unittest.TestCase):
         self.assertEqual((got["reason"], got["tickets"][0]["id"], got["tickets"][0]["status"]), ("comments", t["id"], "done"))
         ticket = self.j("GET", f"/api/tickets/{t['id']}", role=None, token=tok)[1]
         self.assertTrue(ticket["what_now"].startswith("Frank left 1 new comment here: read it and reply"), ticket["what_now"])
-        self.assertIn("agent-cm hasn't answered your latest comment", self.call("GET", f"/t/{t['id']}", role="human")[1].decode())
+        self.assertIn('<a class="who-link" href="/u/agent-cm">agent-cm</a> hasn\'t answered your latest comment', self.call("GET", f"/t/{t['id']}", role="human")[1].decode())
         self.j("POST", f"/api/tickets/{t['id']}/comments", {"body": "Will do, thanks!"}, role=None, token=tok)
         self.assertEqual(W()["reason"], "timeout")
         self.assertEqual(self.j("GET", f"/api/tickets/{t['id']}", role="human")[1]["status"], "done")
@@ -1779,6 +1779,63 @@ class ProjectsTest(unittest.TestCase):
                                                   "status": kw.pop("status", "ready"), **kw}, who)
         self.assertEqual(code, 201, t)
         return t
+
+    def test_an_agents_page_and_its_live_output_are_for_the_people_it_works_for(self):
+        st = self.srv.store                            # an agent of its own: no other test's tickets to keep it watched
+        self.keys["livy"] = st.add_user("livy", "agent", "test")[1]
+        st.set_member("records", "livy", "member", "boss")
+        t = self.ticket("records", title="Live work")
+        self.assertEqual(self.j("PATCH", f"/api/tickets/{t['id']}", {"assignee": "livy"})[0], 200)
+        code, r = self.j("POST", "/api/live", {"lines": ["12:00:01 livy> on it", "    the second line"],
+                                               "status": "working", "goal": "file the records"}, "livy")
+        self.assertEqual((code, r["seq"]), (200, 2))
+        self.assertEqual(self.j("POST", "/api/live", {"lines": ["x"]}, "alice")[0], 403)      # an agent's own, only
+        for who in ("alice", "carl", "boss"):          # in its ticket's project (a viewer too), or a global admin
+            code, got = self.j("GET", "/api/live/livy", who=who)
+            self.assertEqual((code, [x["text"] for x in got["lines"]], got["status"]),
+                             (200, ["12:00:01 livy> on it", "    the second line"], "working"), who)
+        for who in ("bob", "lena"):                    # another team; another agent
+            self.assertEqual(self.j("GET", "/api/live/livy", who=who)[0], 403, who)
+        # a watcher waits for what's next, and gets it as it's said
+        later = threading.Timer(0.5, lambda: self.j("POST", "/api/live", {"lines": ["12:00:02 livy> done"]}, "livy"))
+        later.start()
+        t0 = time.time()
+        code, got = self.j("GET", "/api/live/livy?after=2&wait=10", who="alice")
+        self.assertEqual([x["text"] for x in got["lines"]], ["12:00:02 livy> done"])
+        self.assertLess(time.time() - t0, 5)
+        # its page: basic facts, and the way in to watch, for those who may
+        code, html = self.j("GET", "/u/livy", who="alice")
+        self.assertIn("Watch it live", html)
+        self.assertIn("in progress", html)
+        code, html = self.j("GET", "/u/livy", who="bob")
+        self.assertNotIn("Watch it live", html)
+        self.assertEqual(self.j("GET", "/u/livy/live", who="bob")[0], 403)
+        self.assertIn("livy: live", self.j("GET", "/u/livy/live", who="alice")[1])
+        # names link to people's pages, on the ticket and in chat
+        self.assertIn('href="/u/livy"', self.j("GET", f"/t/{t['id']}", who="alice")[1])
+        # done: it isn't working for them any more
+        self.assertEqual(self.j("PATCH", f"/api/tickets/{t['id']}", {"status": "done"})[0], 200)
+        self.assertEqual(self.j("GET", "/api/live/livy", who="alice")[0], 403)
+
+    def test_chat_waits_for_a_new_message_for_a_harness(self):
+        code, c = self.j("POST", "/api/chat", {"title": "quick", "members": ["rita"], "body": "first?"}, "alice")
+        self.assertEqual(code, 201, c)
+        code, got = self.j("GET", "/api/chat/inbox?flat=1", who="rita")
+        mine = [m for m in got["messages"] if m["text"] == "first?"]
+        self.assertTrue(mine and mine[0]["needs_reply"])
+        newest = max(m["id"] for m in got["messages"])
+        later = threading.Timer(0.5, lambda: self.j("POST", f"/api/chat/{mine[0]['thread']}/messages",
+                                                   {"body": "second?"}, "alice"))
+        later.start()
+        t0 = time.time()
+        code, got = self.j("GET", f"/api/chat/inbox?flat=1&wait=20&after={newest}", who="rita")
+        self.assertIn("second?", [m["text"] for m in got["messages"]])
+        self.assertLess(time.time() - t0, 8)
+        # and /api/wait?chat=0 waits for the rest (its harness has the chat), with no chat notice on it
+        code, w = self.j("GET", "/api/wait?timeout=1&chat=0", who="rita")
+        self.assertNotEqual(w["reason"], "chat")
+        self.assertNotIn("chat", {k for k, v in w.items() if v})
+        self.assertEqual(self.j("GET", "/api/wait?timeout=1", who="rita")[1]["reason"], "chat")
 
     def test_reads_are_scoped(self):
         t = self.ticket("records", title="Records only")

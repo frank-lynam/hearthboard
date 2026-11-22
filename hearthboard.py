@@ -30,6 +30,7 @@ backlog or done tickets (comments are always allowed). Only a hash of each
 token is stored. API docs: GET /api.
 """
 import argparse
+import collections
 import shutil
 import subprocess
 import email.message
@@ -103,6 +104,7 @@ REVIEW_HELP = (
 COMMENT_QUIET_MINUTES = 20  # an agent's in-progress ticket with no comment for this long gets a nudge
 
 PAGE = 20  # comments or messages shown (and returned) at a time; older ones on request
+LIVE_KEEP = 1000  # lines of an agent's live output the board keeps (in memory: a window, not a record)
 
 AGENT_TARGETS = {"ready", "in_progress", "review"}  # statuses an agent may set
 AGENT_LOCKED = {"backlog", "done"}                  # tickets an agent may only comment on
@@ -371,6 +373,8 @@ class Store:
         self.local = threading.local()
         self.write_lock = threading.Lock()
         self.changed = threading.Condition()  # notified after every change; /api/wait sleeps on it
+        self.live = {}                        # agent (lower case) -> what its harness last said it's doing
+        self.live_changed = threading.Condition()   # notified when an agent's live window grows
         self.upgraded = None                  # with upgrade: what the upgrade did
         db = self.db()
         fresh = not db.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'tickets'").fetchone()
@@ -1680,6 +1684,68 @@ class Store:
             raise ApiError(404, "no such version")
         return dict(row)
 
+    # --- live: what an agent says as it works, sent by its harness (hobkin), for the humans it works for. Kept in
+    # memory: a window of the last LIVE_KEEP lines, not a record (the tickets and chat are the record)
+    def can_watch(self, agent):
+        """Whether this request may watch `agent` live: global admins, and humans (guests too) in a project where
+        it has an open ticket (one that isn't done)."""
+        v = self._viewer()
+        if v is None or v["global"]:
+            return True
+        if v["kind"] not in ("human", "guest"):
+            return False
+        pids = {r[0] for r in self.db().execute(
+            "SELECT DISTINCT project_id FROM tickets WHERE assignee = ? COLLATE NOCASE AND status != 'done' "
+            "AND cancelled = 0", (agent,))}
+        return bool(pids & set(v["roles"]))
+
+    def live_post(self, agent, lines, status=None, goal=None):
+        """An agent's harness adds what it said (lines of text, as its terminal shows them) and how it's doing."""
+        with self.live_changed:
+            box = self.live.setdefault(agent.lower(), {"name": agent, "lines": collections.deque(maxlen=LIVE_KEEP),
+                                                       "seq": 0, "status": None, "goal": None, "at": None})
+            for text in list(lines or [])[:LIVE_KEEP]:
+                box["seq"] += 1
+                box["lines"].append({"seq": box["seq"], "text": str(text)[:4000]})
+            box.update(status=str(status)[:200] if status else box["status"],
+                       goal=str(goal)[:500] if goal is not None else box["goal"], at=time.time())
+            self.live_changed.notify_all()
+            return box["seq"]
+
+    def live_read(self, agent, after=0, wait=0.0):
+        """What `agent` said after line `after` (waiting up to `wait` seconds for more), with its status."""
+        end = time.time() + max(0.0, min(float(wait), 60.0))
+        with self.live_changed:
+            while True:
+                box = self.live.get(agent.lower())
+                if box and after > box["seq"]:          # the board restarted: start again from what there is
+                    after = 0
+                new = [dict(x) for x in box["lines"] if x["seq"] > after] if box else []
+                if new or time.time() >= end:
+                    break
+                self.live_changed.wait(max(0.05, end - time.time()))
+        box = box or {}
+        return {"lines": new, "seq": box.get("seq", 0), "status": box.get("status"), "goal": box.get("goal"),
+                "at": box.get("at")}
+
+    def profile(self, username):
+        """A person's or agent's page: who they are, their projects and tickets (only what this request can see)."""
+        u = self.user(username)
+        if not u:
+            raise ApiError(404, f"no user {username!r}")
+        u = dict(u)
+        see = self.visible_ids()
+        u["projects"] = {r[0]: r[1] for r in self.db().execute(
+            "SELECT p.slug, m.role FROM project_members m JOIN projects p ON p.id = m.project_id "
+            "WHERE m.username = ? COLLATE NOCASE" + ("" if see is None else
+            f" AND p.id IN ({','.join('?' * len(see)) or 'NULL'})") + " ORDER BY p.slug",
+            [username] + ([] if see is None else list(see)))}
+        mine = self.tickets(assignee=u["username"], recent_first=True, limit=500)
+        u["counts"] = {st: sum(1 for t in mine if t["status"] == st) for st in STATUSES}
+        u["recent"] = mine[:15]
+        u["global_admin"] = bool(u.get("global_admin"))
+        return u
+
     # --- waiting: an idle agent holds GET /api/wait open until there's something for it
     def bump(self):
         with self.changed:
@@ -1790,7 +1856,7 @@ class Store:
                                            "why": f"{who} commented ({r['n']} new): read it and reply on the ticket"}))
         return out
 
-    def wait_for(self, user, timeout, queue=False, projects=None):
+    def wait_for(self, user, timeout, queue=False, projects=None, chat=True):
         """What `user` should do next, as soon as there's anything: chat they owe; humans' comments on
         their tickets they haven't replied to; other changes to their tickets since the call began; their
         in-progress and ready tickets; with `queue`, anyone's ready tickets. Only when there's none of that
@@ -1799,7 +1865,7 @@ class Store:
         steps = [("queue", lambda: self.outstanding(user, "ready", assigned=False, projects=projects) if queue else [],
                   "ready for anyone: take it with POST /api/next")]
         while True:
-            notice = self.chat_notice(user)
+            notice = self.chat_notice(user) if chat else None     # chat=False: its harness takes chat itself
             if notice:
                 return {"reason": "chat", "chat": notice, "tickets": []}
             owed = self.comments_owed(user, projects=projects)
@@ -2450,6 +2516,10 @@ font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;margin:0 0 8px}
 .c{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 14px}
 .c.agent{border-left:3px solid var(--agent)}
 .c .who{font-weight:600}.c .who.agent{color:var(--agent)}
+a.who-link{color:inherit;text-decoration:none}a.who-link:hover{text-decoration:underline}
+.live{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px;line-height:1.45;white-space:pre-wrap;
+ overflow-wrap:anywhere;border:1px solid #8884;border-radius:8px;padding:10px 12px;max-height:75vh;overflow-y:auto}
+.live .lw{font-weight:700;color:var(--agent)}.live .lh{opacity:.6}.live .lt{opacity:.5}
 .c .body{overflow-wrap:anywhere;margin-top:4px}
 .ev{color:var(--dim);font-size:13px;padding:0 4px}
 .att{margin-top:8px}
@@ -2747,6 +2817,11 @@ def link_part(part):
 
 def linkify(text):
     return "".join(link_part(p) if i % 2 else p for i, p in enumerate(LINKABLE.split(esc(text))))
+
+
+def who(name):
+    """A user's name as a link to their page (anywhere a name is shown, except inside another link)."""
+    return f'<a class="who-link" href="/u/{quote(str(name), safe="")}">{esc(name)}</a>' if name else ""
 
 
 CHAT_BADGE = "<!--chat-badge-->"
@@ -3215,6 +3290,84 @@ if ($('uf')) $('uf').onsubmit = async (e) => {{ e.preventDefault();
     return page("Users", body, "/users", len(store.tickets(["review"])))
 
 
+def render_profile(store, name):
+    """A person's or agent's page: who they are, their projects and the tickets they work (only what the viewer
+    can see), and for an agent the humans it works for (and global admins) can watch, a link to its live output."""
+    u = store.profile(name)
+    agent = u["kind"] == "agent"
+    chip = f'<span class="chip {"s-in_progress" if u["kind"] == "human" else "s-ready"}">{u["kind"]}</span>'
+    badge = ' <span class="chip s-review">Global admin</span>' if u["global_admin"] else ""
+    off = ' <span class="chip s-backlog">Disabled</span>' if u["disabled"] else ""
+    projs = ", ".join(f'<a href="/p/{slug}">{esc(slug)}</a> ({role})' for slug, role in u["projects"].items())
+    c = u["counts"]
+    stat = lambda n, label: f'<div class="card"><div class="t" style="font-size:22px">{n}</div><div class="meta">{label}</div></div>'
+    stats = (f'<div class="cols">{stat(c["in_progress"], "in progress")}{stat(c["ready"], "ready")}'
+             f'{stat(c["review"], "waiting for review")}{stat(c["done"], "done")}</div>')
+    live = ""
+    if agent:
+        box = store.live.get(u["username"].lower())
+        if store.can_watch(u["username"]):
+            now = (f'{esc(box["status"] or "")}{" · " + esc(box["goal"]) if box.get("goal") else ""} · '
+                   f'heard from {ago(box["at"]) or "just now"}' if box and box.get("at") else
+                   "nothing heard from it yet (its harness sends this: hobkin does)")
+            live = (f'<p class="box"><a class="primary" href="/u/{quote(u["username"], safe="")}/live">Watch it live</a>'
+                    f' <span class="meta">{now}</span></p>')
+        else:
+            live = '<p class="meta">Its live output is for the people it works for (and global admins).</p>'
+    recent = "".join(card(t) for t in u["recent"]) or '<p class="empty">No tickets yet.</p>'
+    body = (f'<h1>{esc(u["username"])} {chip}{badge}{off}</h1>'
+            f'<p class="meta">added {when(u["created_at"])}{" by " + who(u["created_by"]) if u["created_by"] else ""}'
+            f' · last seen {ago(u["last_seen"]) if u["last_seen"] else "never"} · projects: {projs or "none you can see"}</p>'
+            f'{live}<h2>Tickets</h2>{stats}<h2>Recent</h2>{recent}')
+    return page(u["username"], body, "/users")
+
+
+LIVE_JS = """
+const box = document.getElementById('live'), state = document.getElementById('lstate');
+let after = 0, stuck = true;
+box.addEventListener('scroll', () => { stuck = box.scrollTop + box.clientHeight >= box.scrollHeight - 30; });
+function line(t) {
+  const d = document.createElement('div'), m = t.match(/^(\\d\\d:\\d\\d:\\d\\d) ([^>]{1,40})> ([\\s\\S]*)$/);
+  if (m) {
+    const c = document.createElement('span'); c.className = 'lt'; c.textContent = m[1] + ' ';
+    const w = document.createElement('span'); w.className = m[2] === 'hobkin' ? 'lh' : 'lw'; w.textContent = m[2] + '> ';
+    const x = document.createElement('span'); if (m[2] === 'hobkin') x.className = 'lh'; x.textContent = m[3];
+    d.append(c, w, x);
+  } else { d.textContent = t; d.className = t.startsWith('    ') ? '' : 'lh'; }
+  return d;
+}
+async function poll() {
+  try {
+    const r = await fetch('/api/live/' + encodeURIComponent(AGENT) + '?wait=25&after=' + after, {credentials: 'same-origin'});
+    if (!r.ok) { state.textContent = r.status === 403 ? "you can't watch it any more" : 'the board went away; trying again'; setTimeout(poll, 5000); return; }
+    const j = await r.json();
+    if (after && j.seq < after) { box.textContent = ''; }
+    for (const l of j.lines) box.append(line(l.text));
+    after = j.seq;
+    state.textContent = (j.status || 'not heard from yet') + (j.goal ? ' · ' + j.goal : '');
+    if (stuck) box.scrollTop = box.scrollHeight;
+    poll();
+  } catch (e) { state.textContent = 'reconnecting...'; setTimeout(poll, 3000); }
+}
+poll();
+"""
+
+
+def render_live(store, name):
+    """An agent's live output: what it says as it works (as `hobkin chat` shows it), as it happens."""
+    u = store.profile(name)
+    if u["kind"] != "agent":
+        raise ApiError(404, f"{name} isn't an agent")
+    if not store.can_watch(u["username"]):
+        raise ApiError(403, "an agent's live output is for the people it works tickets for (and global admins)")
+    body = (f'<h1>{who(u["username"])}: live</h1><p class="meta" id="lstate">connecting...</p>'
+            f'<div class="live" id="live" aria-live="polite"></div>'
+            f'<p class="meta">What it says as it works, as its terminal shows it (the last {LIVE_KEEP} lines; '
+            f'kept in memory, not saved). Its tickets and chat are the record.</p>'
+            f'<script>const AGENT = {json.dumps(u["username"])};{LIVE_JS}</script>')
+    return page(f"{u['username']}: live", body, "/users")
+
+
 def project_switcher(store, current):
     """The top bar's project picker: the viewer's projects; the current one selected."""
     ps = [p for p in store.projects() if not p["archived"] or p["slug"] == current]
@@ -3534,46 +3687,46 @@ def ticket_timeline(store, t, empty='<p class="empty">No activity yet.</p>'):
         files = "".join(render_attachment(a, store) for a in mine)
         role = "agent" if c["role"] == "agent" else ""
         items.append((c["created_at"], f'<div class="c {role}" id="c{c["id"]}" data-v="{len(mine)}">'
-                                       f'<span class="who {role}">{esc(c["author"])}</span> '
+                                       f'<span class="who {role}">{who(c["author"])}</span> '
                                        f'<span class="meta" title="{when(c["created_at"])}">{ago(c["created_at"])}</span>'
                                        f'<div class="body md">{wiki_html(store, c["body"])}</div>{files}</div>'))
     for a in loose:
         items.append((a["created_at"], f'<div class="c {"agent" if a["role"] == "agent" else ""}" id="a{a["id"]}">'
-                                       f'<span class="who">{esc(a["author"])}</span> <span class="meta">attached a file · '
+                                       f'<span class="who">{who(a["author"])}</span> <span class="meta">attached a file · '
                                        f'{ago(a["created_at"])}</span>{render_attachment(a, store)}</div>'))
     for e in t["events"]:
         if e["field"] == "created":
-            text = f'{esc(e["actor"])} created it in {LABELS.get(e["new"], e["new"])}'
+            text = f'{who(e["actor"])} created it in {LABELS.get(e["new"], e["new"])}'
         elif e["field"] == "proposed":
-            text = f'{esc(e["actor"])} proposed it'
+            text = f'{who(e["actor"])} proposed it'
         elif e["field"] == "accepted":
-            text = f'{esc(e["actor"])} accepted it into {LABELS.get(e["new"], e["new"])}'
+            text = f'{who(e["actor"])} accepted it into {LABELS.get(e["new"], e["new"])}'
         elif e["field"] == "cancelled":
-            text = f'{esc(e["actor"])} <b>cancelled</b> it'
+            text = f'{who(e["actor"])} <b>cancelled</b> it'
         elif e["field"] == "declined":
-            text = f'{esc(e["actor"])} <b>declined</b> it'
+            text = f'{who(e["actor"])} <b>declined</b> it'
         elif e["field"] == "depends_on":
-            text = (f'{esc(e["actor"])} said <a href="/t/{esc(e["new"])}">{esc(e["new"])}</a> must be done first' if e["new"]
-                    else f'{esc(e["actor"])} removed the dependency on {esc(e["old"])}')
+            text = (f'{who(e["actor"])} said <a href="/t/{esc(e["new"])}">{esc(e["new"])}</a> must be done first' if e["new"]
+                    else f'{who(e["actor"])} removed the dependency on {esc(e["old"])}')
         elif e["field"] == "priority":
             label = PRIORITIES.get(int(e["new"]), e["new"]) if str(e["new"]).isdigit() else e["new"]
-            text = f'{esc(e["actor"])} set the priority to <b>{esc(label)}</b>'
+            text = f'{who(e["actor"])} set the priority to <b>{esc(label)}</b>'
         elif e["field"] == "epic_status":
-            text = f'the epic is now <b>{EPIC_STATES.get(e["new"], e["new"])}</b> (after a change by {esc(e["actor"])})'
+            text = f'the epic is now <b>{EPIC_STATES.get(e["new"], e["new"])}</b> (after a change by {who(e["actor"])})'
         elif e["field"] == "checklist":
-            text = f'{esc(e["actor"])} reported the checklist: {esc(e["new"])} done'
+            text = f'{who(e["actor"])} reported the checklist: {esc(e["new"])} done'
         elif e["field"] == "epic_id":
-            text = (f'{esc(e["actor"])} moved it into epic <a href="/t/{esc(e["new"])}">{esc(e["new"])}</a>' if e["new"]
-                    else f'{esc(e["actor"])} took it out of its epic')
+            text = (f'{who(e["actor"])} moved it into epic <a href="/t/{esc(e["new"])}">{esc(e["new"])}</a>' if e["new"]
+                    else f'{who(e["actor"])} took it out of its epic')
         elif e["field"] == "status":
-            text = f'{esc(e["actor"])} {status_phrase(e["old"], e["new"], e["role"])}'
+            text = f'{who(e["actor"])} {status_phrase(e["old"], e["new"], e["role"])}'
         elif e["field"] == "assignee":
-            text = (f'{esc(e["actor"])} assigned it to <b>{esc(e["new"])}</b>' if e["new"]
-                    else f'{esc(e["actor"])} unassigned it')
+            text = (f'{who(e["actor"])} assigned it to <b>{who(e["new"])}</b>' if e["new"]
+                    else f'{who(e["actor"])} unassigned it')
         elif e["field"] == "description":
-            text = f'{esc(e["actor"])} edited the description'
+            text = f'{who(e["actor"])} edited the description'
         else:
-            text = f'{esc(e["actor"])} changed {esc(e["field"]).replace("_", " ")} to {esc(e["new"] or "nothing")}'
+            text = f'{who(e["actor"])} changed {esc(e["field"]).replace("_", " ")} to {esc(e["new"] or "nothing")}'
         items.append((e["at"], f'<div class="ev" id="e{e["id"]}">{text} · <span title="{when(e["at"])}">{ago(e["at"])}</span></div>'))
     items.sort(key=lambda x: x[0])
     return "".join(h for _, h in items) or empty
@@ -3701,7 +3854,7 @@ def render_ticket(store, tid):
 
     banners = ""
     if t["proposed"]:
-        banners += (f'<div class="banner prop">Proposed by {esc(t["created_by"])}. '
+        banners += (f'<div class="banner prop">Proposed by {who(t["created_by"])}. '
                     + assign_select(store, t["id"], t["assignee"], "Assign its tickets to" if t["kind"] == "epic" else "Assign to")
                     + " " + prio_select(t["id"], t["priority"])
                     + f' <button class="primary" onclick="review(TID,\'accept\',false)">Accept</button> '
@@ -3769,7 +3922,7 @@ def render_ticket(store, tid):
     else:
         comment_buttons = '<button class="primary" id="csend">Comment</button>'
     owed = store.comments_owed(t["assignee"], t["id"]) if t["assignee"] else []
-    unanswered = (f'<p class="meta unanswered">{esc(t["assignee"])} hasn\'t answered '
+    unanswered = (f'<p class="meta unanswered">{who(t["assignee"])} hasn\'t answered '
                   f'{"your latest comment" if owed[0]["new_comments"] == 1 else str(owed[0]["new_comments"]) + " comments"} '
                   f'yet.</p>' if owed and store.user(t["assignee"])["kind"] == "agent" else "")
     if s == "review" and t["kind"] == "ticket" and not t["proposed"]:
@@ -3804,7 +3957,7 @@ def render_ticket(store, tid):
     body = f"""<div class="row" style="margin-bottom:6px"><span class="id">{t['id']}</span>
 <a class="chip" href="/p/{t['project']}" title="Project">{esc(t['project_name'] or '')}</a>
 <span class="chip s-{s}">{"Cancelled" if t["cancelled"] else "Declined" if t["declined"] else (EPIC_STATES if t['kind'] == 'epic' else LABELS)[s]}</span>{'<span class="p1">High priority</span>' if t['priority'] == 1 else ''}
-<span class="meta">{'assigned to <b>' + esc(t['assignee']) + '</b>' if t['assignee'] else 'unassigned'}</span>
+<span class="meta">{'assigned to <b>' + who(t['assignee']) + '</b>' if t['assignee'] else 'unassigned'}</span>
 {'<span class="tag epic">Epic</span>' if t['kind'] == 'epic' else ''}
 {f'<span class="meta">in epic <a href="/t/{t["epic_id"]}">{t["epic_id"]} · {esc(t.get("epic_title") or "")}</a></span>' if t['epic_id'] else ''}</div>
 <h1>{esc(t['title'])}</h1>
@@ -3955,7 +4108,7 @@ def render_message(store, m, viewer):
     role = "agent" if m["role"] == "agent" else ""
     mine = " mine" if m["author"].lower() == viewer.lower() else ""
     files = "".join(render_attachment(f, store) for f in m["attachments"])
-    return (f'<div class="msg {role}{mine}" id="m{m["id"]}"><div><span class="who {role}">{esc(m["author"])}</span> '
+    return (f'<div class="msg {role}{mine}" id="m{m["id"]}"><div><span class="who {role}">{who(m["author"])}</span> '
             f'<span class="meta" title="{when(m["created_at"])}">{ago(m["created_at"])}</span>'
             f'<a class="mk" href="/new?from_message={m["id"]}" title="Make a ticket from this message">→ ticket</a></div>'
             f'<div class="body md">{wiki_html(store, m["body"])}</div>{files}</div>')
@@ -4117,7 +4270,7 @@ def render_chat(store, cid, viewer):
     body = f"""<p class="meta" style="margin:0 0 4px"><a href="/chat">← Chat</a></p>
 <div class="row" style="justify-content:space-between;align-items:baseline"><h1 style="margin-bottom:4px">{esc(c["name"])}</h1>
 <button type="button" class="cancel" onclick="deleteChat()">Delete chat</button></div>
-<div class="meta">With {esc(", ".join(c["members"]) or "no one yet")}. {scope}</div>{add}
+<div class="meta">With {", ".join(who(x) for x in c["members"]) or "no one yet"}. {scope}</div>{add}
 <div id="chatroom" data-cid="{c["id"]}" data-last="{last}" style="margin-top:14px">{earlier}
 <div class="chat" id="msgs">{shown or '<p class="empty" id="none">No messages yet. Say hello.</p>'}</div>
 <p class="meta receipt" id="receipt">{receipt_html(store, c["id"])}</p>
@@ -4735,6 +4888,16 @@ That way two agents never owe each other replies forever.
 Keep chat for things that aren't about one ticket. Work on a ticket is
 discussed in comments on the ticket, where the humans review it.
 
+**For harnesses (the program that runs an agent):** chat can be as quick as a
+terminal. `GET /api/chat/inbox?flat=1&wait=50&after=ID` holds the request
+until there's a message newer than `ID` (the newest you have), then returns
+them, oldest first; deliver each to your agent and post what it says back
+(`POST /api/chat/ID/messages`). `GET /api/wait?chat=0` then waits for
+everything but chat. And `POST /api/live` `{"lines": ["what it said", ...],
+"status": "working", "goal": "..."}` shows what your agent says as it works on
+its page, live, to the people it works tickets for (the board keeps the last
+1000 lines in memory). hobkin does all three.
+
 ## Staying reachable when you're idle
 
 Humans expect an answer to chat, and to their replies on your tickets,
@@ -5151,11 +5314,12 @@ class Handler(BaseHTTPRequestHandler):
             notice = self.server.store.chat_notice(actor)
             if notice:
                 extra["X-Chat-Inbox"] = str(notice["count"])
-                if isinstance(obj, dict) and not getattr(self, "req_path", "").startswith("/api/chat"):
+                if isinstance(obj, dict) and not getattr(self, "req_path", "").startswith("/api/chat") \
+                        and not getattr(self, "chat_by_harness", False):
                     obj = {**obj, "chat": notice}
         self.send(code, json.dumps(obj, default=str), "application/json; charset=utf-8", extra)
-        if self.command not in ("GET", "HEAD") and code < 400:
-            self.server.store.bump()  # wake anyone waiting in /api/wait
+        if self.command not in ("GET", "HEAD") and code < 400 and getattr(self, "req_path", "") != "/api/live":
+            self.server.store.bump()  # wake anyone waiting in /api/wait (a live post isn't a change to the board)
 
     def redirect(self, location, cookie=None):
         self.send_response(303)
@@ -5279,7 +5443,7 @@ class Handler(BaseHTTPRequestHandler):
         query = parse_qs(url.query)
         path = url.path.rstrip("/") or "/"
         store = self.server.store
-        self.who_is, self.req_path = (None, None), path
+        self.who_is, self.req_path, self.chat_by_harness = (None, None), path, False
         try:
             role, actor, bearer = self.who(query)
             self.who_is = (role, actor)
@@ -5380,7 +5544,10 @@ class Handler(BaseHTTPRequestHandler):
                 timeout = max(1, min(300, int(t) if t.isdigit() else 50))
                 queue = (query.get("queue") or [""])[0] in ("1", "true", "yes")
                 want = (query.get("project") or [""])[0]
-                return self.json(200, store.wait_for(actor, timeout, queue, store.project_ids(want) if want else None))
+                # chat=0: a harness that delivers chat to its agent itself (hobkin) waits for the rest only
+                self.chat_by_harness = (query.get("chat") or [""])[0] == "0"
+                return self.json(200, store.wait_for(actor, timeout, queue, store.project_ids(want) if want else None,
+                                                     chat=not self.chat_by_harness))
             if path.startswith("/api/chat"):
                 return self.chat_api(method, path, query, actor, role)
             if method == "GET" and path == "/api/skill":
@@ -5436,6 +5603,31 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(404, "not found")
             um = re.fullmatch(r"/api/users(?:/([^/]+))?(/token)?", path)
             # --- routes: people (users, me, prefs, guidance, settings), projects and members, export
+            if method == "GET" and (pu := re.fullmatch(r"/u/([^/]+)(/live)?", path)):
+                name_ = unquote(pu.group(1))
+                return self.html(render_live(store, name_) if pu.group(2) else render_profile(store, name_))
+            if (lu := re.fullmatch(r"/api/live(?:/([^/]+))?", path)):
+                if method == "POST" and not lu.group(1):
+                    if role != "agent":
+                        raise ApiError(403, "the live feed is an agent's: its harness posts what it says")
+                    d = self.body_json(("lines", "status", "goal"))
+                    if not isinstance(d.get("lines", []), list):
+                        raise ApiError(400, 'send {"lines": ["what it said", ...], "status": "...", "goal": "..."}')
+                    return self.json(200, {"seq": store.live_post(actor, d.get("lines") or [], d.get("status"),
+                                                                  d.get("goal"))})
+                if method == "GET" and lu.group(1):
+                    name_ = unquote(lu.group(1))
+                    if not store.user(name_):
+                        raise ApiError(404, f"no user {name_!r}")
+                    if not store.can_watch(name_):
+                        raise ApiError(403, "an agent's live output is for the people it works tickets for "
+                                            "(and global admins)")
+                    try:
+                        after, wait = int((query.get("after") or ["0"])[0]), float((query.get("wait") or ["0"])[0])
+                    except ValueError:
+                        raise ApiError(400, "after and wait are numbers")
+                    return self.json(200, store.live_read(name_, after, wait))
+                raise ApiError(405, "POST /api/live (an agent's harness), or GET /api/live/NAME (people watching)")
             if method == "GET" and path == "/users":
                 if role != "human":
                     raise ApiError(403, "only humans manage users")
@@ -5610,17 +5802,30 @@ class Handler(BaseHTTPRequestHandler):
                 return self.json(201, store.conversation_detail(cid, actor, mark=False))
         if path == "/api/chat/inbox" and method == "GET":
             # Agents: everything they still owe (human messages until they reply). Humans: unread.
-            convs = store.chat_attention(actor) if role == "agent" else store.unread(actor)
-            for c in convs:  # humans' unread list: same shape
-                c.setdefault("count", len(c["messages"]))
-                c["messages"] = c["messages"][-PAGE:]
+            def inbox():
+                convs = store.chat_attention(actor) if role == "agent" else store.unread(actor)
+                for c in convs:  # humans' unread list: same shape
+                    c.setdefault("count", len(c["messages"]))
+                    c["messages"] = c["messages"][-PAGE:]
+                return convs
+            convs = inbox()
             if (query.get("flat") or [""])[0] == "1":
-                # For agent harnesses (hobkin's front desk): one list, oldest first; needs_reply is false for
-                # messages that only need reading (other agents', notes), so a harness can leave those be.
-                flat = [{"id": m["id"], "thread": c["id"], "thread_name": c["name"], "from": m["author"],
-                         "text": m["body"], "needs_reply": m["role"] == "human"}
-                        for c in convs for m in c["messages"]]
-                return self.json(200, {"messages": sorted(flat, key=lambda x: x["id"])})
+                # For agent harnesses (hobkin): one list, oldest first; needs_reply is false for messages that only
+                # need reading (other agents', notes). With wait=N (and after=ID, the newest it has), it holds the
+                # request until there's a message newer than that, or N seconds pass: chat as fast as a terminal.
+                flatten = lambda cs: sorted(({"id": m["id"], "thread": c["id"], "thread_name": c["name"],
+                                              "from": m["author"], "text": m["body"], "needs_reply": m["role"] == "human"}
+                                             for c in cs for m in c["messages"]), key=lambda x: x["id"])
+                try:
+                    wait, after = float((query.get("wait") or ["0"])[0]), int((query.get("after") or ["0"])[0])
+                except ValueError:
+                    raise ApiError(400, "wait and after are numbers")
+                flat, end = flatten(convs), time.time() + max(0.0, min(wait, 60.0))
+                while wait and not any(m["id"] > after for m in flat) and time.time() < end:
+                    with store.changed:
+                        store.changed.wait(min(5.0, max(0.05, end - time.time())))
+                    flat = flatten(inbox())
+                return self.json(200, {"messages": flat})
             return self.json(200, {"count": sum(c["count"] for c in convs), "conversations": convs})
         m = re.fullmatch(r"/api/chat/(\d+)(/messages|/attachments|/members|/read)?", path)
         if m:
